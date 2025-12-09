@@ -1,0 +1,151 @@
+---
+- name: Configure *arr apps to watch FileBot output directories
+  hosts: media-server
+  gather_facts: false
+
+  vars:
+    # SMB share path on media-server
+    smb_share_base: "//192.168.1.80/MediaProcessing"
+    smb_mount_base: "/mnt/win-media-ingest"
+
+    # FileBot output paths (as seen from media-server via SMB)
+    filebot_output:
+      movies: "{{ smb_mount_base }}/output/movies"
+      tv: "{{ smb_mount_base }}/output/tv"
+      music: "{{ smb_mount_base }}/output/music"
+
+  tasks:
+    - name: Display configuration info
+      debug:
+        msg:
+          - "=== Configuring *arr Apps Watch Folders ==="
+          - "Radarr will monitor: {{ filebot_output.movies }}"
+          - "Sonarr will monitor: {{ filebot_output.tv }}"
+          - "Lidarr-Lossless will monitor: {{ filebot_output.music }}"
+
+    # Create mount point for SMB share
+    - name: Create SMB mount directory
+      file:
+        path: "{{ smb_mount_base }}"
+        state: directory
+        mode: '0755'
+      become: true
+
+    - name: Check if SMB share is already mounted
+      shell: mount | grep "{{ smb_mount_base }}"
+      register: mount_check
+      failed_when: false
+      changed_when: false
+
+    - name: Mount Windows SMB share (if not already mounted)
+      shell: |
+        mount -t cifs "{{ smb_share_base }}" "{{ smb_mount_base }}" \
+          -o username={{ vault_privado_vpn.username | default('guest') }},password={{ vault_privado_vpn.password | default('') }},vers=3.0
+      become: true
+      when: mount_check.rc != 0
+      failed_when: false
+      register: mount_result
+
+    - name: Add SMB mount to /etc/fstab for persistence
+      lineinfile:
+        path: /etc/fstab
+        line: "{{ smb_share_base }} {{ smb_mount_base }} cifs username={{ vault_privado_vpn.username | default('guest') }},password={{ vault_privado_vpn.password | default('') }},vers=3.0,_netdev 0 0"
+        state: present
+      become: true
+      when: mount_check.rc != 0
+
+    # Configure Radarr to watch movies folder
+    - name: Get existing Radarr root folders
+      uri:
+        url: "http://192.168.1.83:7878/api/v3/rootfolder"
+        method: GET
+        headers:
+          X-Api-Key: "{{ vault_radarr_api_key }}"
+        status_code: 200
+      register: radarr_root_folders
+
+    - name: Add FileBot movies folder to Radarr
+      uri:
+        url: "http://192.168.1.83:7878/api/v3/rootfolder"
+        method: POST
+        headers:
+          X-Api-Key: "{{ vault_radarr_api_key }}"
+        body_format: json
+        body:
+          path: "{{ filebot_output.movies }}"
+        status_code: [201, 400]
+      register: radarr_folder_add
+      failed_when: radarr_folder_add.status == 400 and 'already exists' not in (radarr_folder_add.content | default(''))
+      when: "filebot_output.movies not in (radarr_root_folders.json | map(attribute='path') | list)"
+
+    # Configure Sonarr to watch TV folder
+    - name: Get existing Sonarr root folders
+      uri:
+        url: "http://192.168.1.83:8989/api/v3/rootfolder"
+        method: GET
+        headers:
+          X-Api-Key: "{{ vault_sonarr_api_key }}"
+        status_code: 200
+      register: sonarr_root_folders
+
+    - name: Add FileBot TV folder to Sonarr
+      uri:
+        url: "http://192.168.1.83:8989/api/v3/rootfolder"
+        method: POST
+        headers:
+          X-Api-Key: "{{ vault_sonarr_api_key }}"
+        body_format: json
+        body:
+          path: "{{ filebot_output.tv }}"
+        status_code: [201, 400]
+      register: sonarr_folder_add
+      failed_when: sonarr_folder_add.status == 400 and 'already exists' not in (sonarr_folder_add.content | default(''))
+      when: "filebot_output.tv not in (sonarr_root_folders.json | map(attribute='path') | list)"
+
+    # Configure Lidarr-Lossless to watch music folder
+    - name: Get existing Lidarr-Lossless root folders
+      uri:
+        url: "http://192.168.1.83:8687/api/v1/rootfolder"
+        method: GET
+        headers:
+          X-Api-Key: "{{ vault_lidarr_lossless_api_key }}"
+        status_code: 200
+      register: lidarr_lossless_root_folders
+
+    - name: Add FileBot music folder to Lidarr-Lossless
+      uri:
+        url: "http://192.168.1.83:8687/api/v1/rootfolder"
+        method: POST
+        headers:
+          X-Api-Key: "{{ vault_lidarr_lossless_api_key }}"
+        body_format: json
+        body:
+          path: "{{ filebot_output.music }}"
+          defaultTags: []
+          defaultQualityProfileId: 1
+          defaultMetadataProfileId: 1
+        status_code: [201, 400]
+      register: lidarr_lossless_folder_add
+      failed_when: lidarr_lossless_folder_add.status == 400 and 'already exists' not in (lidarr_lossless_folder_add.content | default(''))
+      when: "filebot_output.music not in (lidarr_lossless_root_folders.json | map(attribute='path') | list)"
+
+    - name: Display configuration summary
+      debug:
+        msg:
+          - "=== Configuration Complete ==="
+          - ""
+          - "SMB Mount Status:"
+          - "  {{ 'Already mounted' if mount_check.rc == 0 else 'Newly mounted' }}"
+          - "  Source: {{ smb_share_base }}"
+          - "  Mount point: {{ smb_mount_base }}"
+          - ""
+          - "Radarr Root Folders:"
+          - "{{ radarr_root_folders.json | map(attribute='path') | list }}"
+          - ""
+          - "Sonarr Root Folders:"
+          - "{{ sonarr_root_folders.json | map(attribute='path') | list }}"
+          - ""
+          - "Lidarr-Lossless Root Folders:"
+          - "{{ lidarr_lossless_root_folders.json | map(attribute='path') | list }}"
+          - ""
+          - "Next: Run FileBot test to rename existing files"

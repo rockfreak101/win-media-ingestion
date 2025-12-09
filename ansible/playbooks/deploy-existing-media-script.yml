@@ -1,0 +1,127 @@
+---
+# Deploy Existing Media Processing Script
+# Deploys Process-Existing-Media.ps1 to Windows server
+#
+# Usage:
+#   ansible-playbook playbooks/deploy-existing-media-script.yml
+
+- name: Deploy existing media processing script
+  hosts: windows_servers
+  gather_facts: no
+  vars:
+    scripts_dir: C:\Scripts
+    logs_dir: C:\Scripts\Logs
+
+  tasks:
+    - name: Create scripts directory
+      win_file:
+        path: "{{ scripts_dir }}"
+        state: directory
+
+    - name: Create logs directory
+      win_file:
+        path: "{{ logs_dir }}"
+        state: directory
+
+    - name: Deploy Process-Existing-Media.ps1
+      win_copy:
+        src: ../../files/Process-Existing-Media.ps1
+        dest: "{{ scripts_dir }}\\Process-Existing-Media.ps1"
+
+    - name: Create Desktop shortcut for script
+      win_copy:
+        content: |
+          $WshShell = New-Object -ComObject WScript.Shell
+          $Shortcut = $WshShell.CreateShortcut("$env:PUBLIC\Desktop\Process Existing Media.lnk")
+          $Shortcut.TargetPath = "powershell.exe"
+          $Shortcut.Arguments = "-ExecutionPolicy Bypass -NoExit -File `"{{ scripts_dir }}\Process-Existing-Media.ps1`""
+          $Shortcut.WorkingDirectory = "{{ scripts_dir }}"
+          $Shortcut.Description = "Process existing media with AV1 encoding"
+          $Shortcut.Save()
+        dest: "{{ scripts_dir }}\\Create-Desktop-Shortcut.ps1"
+
+    - name: Create desktop shortcut
+      win_shell: |
+        powershell -ExecutionPolicy Bypass -File "{{ scripts_dir }}\Create-Desktop-Shortcut.ps1"
+      ignore_errors: yes
+
+    - name: Verify script deployed
+      win_stat:
+        path: "{{ scripts_dir }}\\Process-Existing-Media.ps1"
+      register: script_stat
+
+    - name: Check FFmpeg installation
+      win_shell: |
+        if (Test-Path "C:\ffmpeg\bin\ffmpeg.exe") {
+          Write-Output "FFmpeg found at C:\ffmpeg\bin\ffmpeg.exe"
+          $version = & "C:\ffmpeg\bin\ffmpeg.exe" -version 2>&1 | Select-String "ffmpeg version"
+          Write-Output $version
+        } else {
+          Write-Output "WARNING: FFmpeg not found at C:\ffmpeg\bin\ffmpeg.exe"
+        }
+      register: ffmpeg_check
+
+    - name: Check NFS mount
+      win_shell: |
+        if (Test-Path X:) {
+          Write-Output "NFS mount found at X:"
+          $usage = Get-PSDrive X | Select-Object Used, Free
+          Write-Output "Used: $([math]::Round($usage.Used / 1GB, 2)) GB"
+          Write-Output "Free: $([math]::Round($usage.Free / 1GB, 2)) GB"
+        } else {
+          Write-Output "WARNING: NFS mount not found at X:"
+        }
+      register: nfs_check
+
+    - name: Check source directories
+      win_shell: |
+        $sources = @{
+          "More_Movies" = "X:/More_Movies"
+          "TV" = "X:/TV"
+        }
+
+        foreach ($name in $sources.Keys) {
+          $path = $sources[$name]
+          if (Test-Path $path) {
+            $count = (Get-ChildItem -Path $path -Recurse -Include *.mkv,*.mp4,*.avi,*.m2ts -File -ErrorAction SilentlyContinue).Count
+            Write-Output "$name found at $path ($count video files)"
+          } else {
+            Write-Output "WARNING: $name not found at $path"
+          }
+        }
+      register: source_check
+
+    - name: Display deployment summary
+      debug:
+        msg:
+          - "============================================"
+          - "Existing Media Processing Script Deployed!"
+          - "============================================"
+          - ""
+          - "Script location: {{ scripts_dir }}\\Process-Existing-Media.ps1"
+          - "Logs directory:  {{ logs_dir }}"
+          - ""
+          - "Prerequisites Check:"
+          - "{{ ffmpeg_check.stdout_lines | join('\n') }}"
+          - "{{ nfs_check.stdout_lines | join('\n') }}"
+          - "{{ source_check.stdout_lines | join('\n') }}"
+          - ""
+          - "Usage:"
+          - "  # Dry run (test)"
+          - "  powershell -File {{ scripts_dir }}\\Process-Existing-Media.ps1 -WhatIf"
+          - ""
+          - "  # Process movies only"
+          - "  powershell -File {{ scripts_dir }}\\Process-Existing-Media.ps1 -SkipTV"
+          - ""
+          - "  # Process TV only"
+          - "  powershell -File {{ scripts_dir }}\\Process-Existing-Media.ps1 -SkipMovies"
+          - ""
+          - "  # Process everything"
+          - "  powershell -File {{ scripts_dir }}\\Process-Existing-Media.ps1"
+          - ""
+          - "IMPORTANT: Stop watch drive services before running!"
+          - "  Stop-ScheduledTask -TaskName 'Media Ingestion*'"
+          - ""
+          - "Desktop shortcut created on Public Desktop"
+          - ""
+          - "See EXISTING-MEDIA-PROCESSING-GUIDE.md for complete guide"

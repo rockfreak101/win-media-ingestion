@@ -1,0 +1,242 @@
+---
+- name: Setup FileBot automation for media renaming
+  hosts: win-ingest-01
+  gather_facts: true
+
+  vars:
+    filebot_version: "5.1.7"
+    media_base: "C:\\MediaProcessing"
+    scripts_dir: "C:\\Scripts\\FileBot"
+
+    # Directory structure
+    watch_dirs:
+      - "{{ media_base }}\\rips\\video\\movies"
+      - "{{ media_base }}\\rips\\video\\tv"
+      - "{{ media_base }}\\rips\\audio\\music"
+      - "{{ media_base }}\\encoded\\movies"
+      - "{{ media_base }}\\encoded\\tv"
+      - "{{ media_base }}\\encoded\\music"
+
+    output_dirs:
+      movies: "{{ media_base }}\\output\\movies"
+      tv: "{{ media_base }}\\output\\tv"
+      music: "{{ media_base }}\\output\\music"
+
+  tasks:
+    - name: Display setup information
+      debug:
+        msg:
+          - "=== FileBot Automation Setup ==="
+          - "Installing FileBot version {{ filebot_version }}"
+          - "Scripts directory: {{ scripts_dir }}"
+          - "Watch directories: {{ watch_dirs }}"
+
+    # Install FileBot
+    - name: Install FileBot via Chocolatey
+      win_chocolatey:
+        name: filebot
+        state: present
+        version: "{{ filebot_version }}"
+      register: filebot_install
+
+    - name: Verify FileBot installation
+      win_shell: |
+        filebot -version
+      register: filebot_version_check
+      changed_when: false
+      failed_when: false
+
+    - name: Display FileBot version
+      debug:
+        msg: "FileBot installed: {{ filebot_version_check.stdout_lines }}"
+
+    # Create directory structure
+    - name: Create output directories
+      win_file:
+        path: "{{ item }}"
+        state: directory
+      loop:
+        - "{{ output_dirs.movies }}"
+        - "{{ output_dirs.tv }}"
+        - "{{ output_dirs.music }}"
+        - "{{ scripts_dir }}"
+
+    # Create FileBot automation scripts
+    - name: Create FileBot movie renaming script
+      win_copy:
+        content: |
+          # FileBot Movie Renaming Script
+          # Renames movies to Plex/Radarr compatible format
+
+          $sourceDir = "{{ media_base }}\encoded\movies"
+          $outputDir = "{{ output_dirs.movies }}"
+          $logFile = "{{ scripts_dir }}\movie-rename.log"
+
+          Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - Starting movie renaming..." | Tee-Object -FilePath $logFile -Append
+
+          # FileBot command for movies
+          & filebot -rename "$sourceDir" `
+            --output "$outputDir" `
+            --db TheMovieDB `
+            --format "{n} ({y})/{n} ({y}) - {vf}" `
+            --action move `
+            --conflict auto `
+            -non-strict `
+            --log-file "$logFile" `
+            --log all
+
+          Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - Movie renaming complete" | Tee-Object -FilePath $logFile -Append
+        dest: "{{ scripts_dir }}\\rename-movies.ps1"
+
+    - name: Create FileBot TV show renaming script
+      win_copy:
+        content: |
+          # FileBot TV Show Renaming Script
+          # Renames TV shows to Plex/Sonarr compatible format
+
+          $sourceDir = "{{ media_base }}\encoded\tv"
+          $outputDir = "{{ output_dirs.tv }}"
+          $logFile = "{{ scripts_dir }}\tv-rename.log"
+
+          Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - Starting TV show renaming..." | Tee-Object -FilePath $logFile -Append
+
+          # FileBot command for TV shows
+          & filebot -rename "$sourceDir" `
+            --output "$outputDir" `
+            --db TheTVDB `
+            --format "{n}/Season {s}/{n} - S{s.pad(2)}E{e.pad(2)} - {t}" `
+            --action move `
+            --conflict auto `
+            -non-strict `
+            --log-file "$logFile" `
+            --log all
+
+          Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - TV show renaming complete" | Tee-Object -FilePath $logFile -Append
+        dest: "{{ scripts_dir }}\\rename-tv.ps1"
+
+    - name: Create FileBot music renaming script
+      win_copy:
+        content: |
+          # FileBot Music Renaming Script
+          # Renames music to Lidarr-Lossless compatible format
+
+          $sourceDir = "{{ media_base }}\encoded\music"
+          $outputDir = "{{ output_dirs.music }}"
+          $logFile = "{{ scripts_dir }}\music-rename.log"
+
+          Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - Starting music renaming..." | Tee-Object -FilePath $logFile -Append
+
+          # FileBot command for music
+          & filebot -rename "$sourceDir" `
+            --output "$outputDir" `
+            --db AcoustID `
+            --format "{artist}/{album}/{artist} - {album} - {pi.pad(2)} - {t}" `
+            --action move `
+            --conflict auto `
+            -non-strict `
+            --log-file "$logFile" `
+            --log all
+
+          Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - Music renaming complete" | Tee-Object -FilePath $logFile -Append
+        dest: "{{ scripts_dir }}\\rename-music.ps1"
+
+    - name: Create master FileBot automation script
+      win_copy:
+        content: |
+          # Master FileBot Automation Script
+          # Processes all media types
+
+          $scriptDir = "{{ scripts_dir }}"
+          $masterLog = "$scriptDir\filebot-automation.log"
+
+          Write-Output "`n======================================" | Tee-Object -FilePath $masterLog -Append
+          Write-Output "FileBot Automation Run: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" | Tee-Object -FilePath $masterLog -Append
+          Write-Output "======================================" | Tee-Object -FilePath $masterLog -Append
+
+          # Check for files in each category
+          $movieFiles = Get-ChildItem "{{ media_base }}\encoded\movies" -Filter *.mkv -Recurse -ErrorAction SilentlyContinue
+          $tvFiles = Get-ChildItem "{{ media_base }}\encoded\tv" -Filter *.mkv -Recurse -ErrorAction SilentlyContinue
+          $musicFiles = Get-ChildItem "{{ media_base }}\encoded\music" -Filter *.flac,*.mp3,*.m4a -Recurse -ErrorAction SilentlyContinue
+
+          Write-Output "Found $($movieFiles.Count) movie files" | Tee-Object -FilePath $masterLog -Append
+          Write-Output "Found $($tvFiles.Count) TV files" | Tee-Object -FilePath $masterLog -Append
+          Write-Output "Found $($musicFiles.Count) music files" | Tee-Object -FilePath $masterLog -Append
+
+          # Run movie renaming if files exist
+          if ($movieFiles.Count -gt 0) {
+              Write-Output "`nProcessing movies..." | Tee-Object -FilePath $masterLog -Append
+              & powershell.exe -ExecutionPolicy Bypass -File "$scriptDir\rename-movies.ps1"
+          }
+
+          # Run TV renaming if files exist
+          if ($tvFiles.Count -gt 0) {
+              Write-Output "`nProcessing TV shows..." | Tee-Object -FilePath $masterLog -Append
+              & powershell.exe -ExecutionPolicy Bypass -File "$scriptDir\rename-tv.ps1"
+          }
+
+          # Run music renaming if files exist
+          if ($musicFiles.Count -gt 0) {
+              Write-Output "`nProcessing music..." | Tee-Object -FilePath $masterLog -Append
+              & powershell.exe -ExecutionPolicy Bypass -File "$scriptDir\rename-music.ps1"
+          }
+
+          Write-Output "`nFileBot automation complete: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" | Tee-Object -FilePath $masterLog -Append
+        dest: "{{ scripts_dir }}\\run-filebot-automation.ps1"
+
+    # Create scheduled task for automation
+    - name: Create scheduled task for FileBot automation
+      win_scheduled_task:
+        name: "FileBot Media Renaming"
+        description: "Automatically rename media files using FileBot"
+        actions:
+          - path: 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
+            arguments: '-ExecutionPolicy Bypass -File "{{ scripts_dir }}\run-filebot-automation.ps1"'
+        triggers:
+          - type: daily
+            start_boundary: '2025-12-04T23:00:00'
+            repetition:
+              interval: PT1H
+              duration: P1D
+        username: SYSTEM
+        run_level: highest
+        enabled: yes
+        state: present
+
+    - name: Create manual test script
+      win_copy:
+        content: |
+          # Manual FileBot Test Script
+          # Run this to test FileBot without waiting for scheduled task
+
+          Write-Host "Running FileBot automation manually..." -ForegroundColor Green
+          & "{{ scripts_dir }}\run-filebot-automation.ps1"
+          Write-Host "`nManual run complete. Check logs in {{ scripts_dir }}" -ForegroundColor Green
+        dest: "{{ scripts_dir }}\\test-filebot.ps1"
+
+    - name: Display setup summary
+      debug:
+        msg:
+          - "=== FileBot Setup Complete ==="
+          - ""
+          - "FileBot installed: {{ filebot_version_check.stdout_lines[0] | default('Unknown') }}"
+          - "Scripts location: {{ scripts_dir }}"
+          - ""
+          - "Output directories:"
+          - "  Movies: {{ output_dirs.movies }}"
+          - "  TV Shows: {{ output_dirs.tv }}"
+          - "  Music: {{ output_dirs.music }}"
+          - ""
+          - "Scheduled task created: Runs every hour"
+          - ""
+          - "To test manually:"
+          - '  powershell -ExecutionPolicy Bypass -File "{{ scripts_dir }}\test-filebot.ps1"'
+          - ""
+          - "Individual scripts:"
+          - "  Movies: {{ scripts_dir }}\\rename-movies.ps1"
+          - "  TV: {{ scripts_dir }}\\rename-tv.ps1"
+          - "  Music: {{ scripts_dir }}\\rename-music.ps1"
+          - ""
+          - "Next steps:"
+          - "  1. Configure Lidarr-Lossless to watch {{ output_dirs.music }}"
+          - "  2. Ensure Radarr watches {{ output_dirs.movies }}"
+          - "  3. Ensure Sonarr watches {{ output_dirs.tv }}"

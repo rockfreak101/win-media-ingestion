@@ -1,0 +1,102 @@
+---
+- name: Test FileBot and setup monitoring
+  hosts: win-ingest-01
+  gather_facts: false
+
+  vars:
+    scripts_dir: "C:\\Scripts\\FileBot"
+
+  tasks:
+    - name: Display test information
+      debug:
+        msg:
+          - "=== Testing FileBot Automation ==="
+          - "This will process existing files in C:\\MediaProcessing\\encoded"
+          - "Output will go to C:\\MediaProcessing\\output"
+
+    - name: Check for existing files to process
+      win_shell: |
+        $movieCount = (Get-ChildItem "C:\MediaProcessing\encoded\movies" -Filter *.mkv -Recurse -ErrorAction SilentlyContinue | Measure-Object).Count
+        $tvCount = (Get-ChildItem "C:\MediaProcessing\encoded\tv" -Filter *.mkv -Recurse -ErrorAction SilentlyContinue | Measure-Object).Count
+        $musicCount = (Get-ChildItem "C:\MediaProcessing\encoded\music" -Filter *.flac,*.mp3,*.m4a -Recurse -ErrorAction SilentlyContinue | Measure-Object).Count
+
+        Write-Output "Movies: $movieCount"
+        Write-Output "TV: $tvCount"
+        Write-Output "Music: $musicCount"
+      register: file_counts
+
+    - name: Display file counts
+      debug:
+        msg: "{{ file_counts.stdout_lines }}"
+
+    - name: Run FileBot automation test
+      win_shell: |
+        powershell.exe -ExecutionPolicy Bypass -File "{{ scripts_dir }}\test-filebot.ps1"
+      register: filebot_test
+      failed_when: false
+
+    - name: Display FileBot test output
+      debug:
+        msg: "{{ filebot_test.stdout_lines }}"
+
+    - name: Check FileBot logs
+      win_shell: |
+        if (Test-Path "{{ scripts_dir }}\filebot-automation.log") {
+          Get-Content "{{ scripts_dir }}\filebot-automation.log" -Tail 50
+        } else {
+          Write-Output "Log file not found"
+        }
+      register: filebot_log
+      failed_when: false
+
+    - name: Display FileBot logs
+      debug:
+        msg: "{{ filebot_log.stdout_lines | default(['No logs yet']) }}"
+
+    - name: Check output directories for renamed files
+      win_shell: |
+        Write-Output "`n=== MOVIES ==="
+        Get-ChildItem "C:\MediaProcessing\output\movies" -Recurse -File -ErrorAction SilentlyContinue |
+          Select-Object -First 10 FullName | Format-List
+
+        Write-Output "`n=== TV SHOWS ==="
+        Get-ChildItem "C:\MediaProcessing\output\tv" -Recurse -File -ErrorAction SilentlyContinue |
+          Select-Object -First 10 FullName | Format-List
+
+        Write-Output "`n=== MUSIC ==="
+        Get-ChildItem "C:\MediaProcessing\output\music" -Recurse -File -ErrorAction SilentlyContinue |
+          Select-Object -First 10 FullName | Format-List
+      register: renamed_files
+      failed_when: false
+
+    - name: Display renamed files
+      debug:
+        msg: "{{ renamed_files.stdout_lines }}"
+
+    - name: Display next steps
+      debug:
+        msg:
+          - "=== Next Steps ==="
+          - ""
+          - "1. Configure network access to Windows share:"
+          - "   - Ensure SMB sharing is enabled on win-ingest-01"
+          - "   - Share C:\\MediaProcessing\\output as 'MediaOutput'"
+          - "   - Allow media-server (192.168.1.83) access"
+          - ""
+          - "2. Add remote paths to *arr apps via web UI:"
+          - "   - Radarr (http://192.168.1.83:7878):"
+          - "     Settings → Media Management → Add Root Folder"
+          - "     Path: \\\\192.168.1.80\\MediaOutput\\movies"
+          - ""
+          - "   - Sonarr (http://192.168.1.83:8989):"
+          - "     Settings → Media Management → Add Root Folder"
+          - "     Path: \\\\192.168.1.80\\MediaOutput\\tv"
+          - ""
+          - "   - Lidarr-Lossless (http://192.168.1.83:8687):"
+          - "     Settings → Media Management → Add Root Folder"
+          - "     Path: \\\\192.168.1.80\\MediaOutput\\music"
+          - ""
+          - "3. Or use existing file transfer workflow:"
+          - "   - Files are renamed in C:\\MediaProcessing\\output"
+          - "   - Existing transfer scripts can move them to NAS"
+          - "   - *arr apps already watch NAS directories"

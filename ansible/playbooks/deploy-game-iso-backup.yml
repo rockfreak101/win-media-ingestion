@@ -1,0 +1,210 @@
+---
+# Deploy Video Game ISO Backup Support
+# Adds video game disc detection and ISO backup functionality to optical drive monitoring
+#
+# Features:
+# - Detects PlayStation, Xbox, Nintendo, PC game discs
+# - Creates ISO backups using dd or ImgBurn
+# - Platform identification and organization
+# - Fully backward compatible with existing DVD/Blu-ray/CD functionality
+#
+# Usage:
+#   ansible-playbook ansible/playbooks/deploy-game-iso-backup.yml
+#
+# Created: 2024-12-07
+
+- name: Deploy video game ISO backup support
+  hosts: win-ingest-01
+  gather_facts: no
+  vars:
+    scripts_dir: C:\Scripts
+    logs_dir: C:\Scripts\Logs
+    local_base: C:\MediaProcessing
+
+    # Software paths
+    makemkv_path: "C:\\Program Files (x86)\\MakeMKV\\makemkvcon64.exe"
+    dbpoweramp_path: "C:\\Program Files\\dBpoweramp\\CDGrab.exe"
+    dd_path: "C:\\Program Files\\dd\\dd.exe"
+    imgburn_path: "C:\\Program Files\\ImgBurn\\ImgBurn.exe"
+
+    # Concurrency limits
+    max_dvd_rips: 2
+    max_bluray_rips: 1
+    max_cd_rips: 1
+    max_game_rips: 1
+
+  tasks:
+    - name: Display deployment information
+      debug:
+        msg: |
+          ============================================
+          VIDEO GAME ISO BACKUP DEPLOYMENT
+          ============================================
+
+          Target: {{ inventory_hostname }} ({{ ansible_host }})
+
+          New Features:
+          - Video game disc detection (PlayStation, Xbox, Nintendo, PC)
+          - Platform identification (PS2, PS3, Xbox360, etc.)
+          - ISO creation using dd or ImgBurn
+          - Organized storage: {{ local_base }}\rips\games\<Platform>\
+
+          Concurrency:
+          - DVD: {{ max_dvd_rips }}
+          - Blu-ray: {{ max_bluray_rips }}
+          - CD: {{ max_cd_rips }}
+          - Game ISO: {{ max_game_rips }}
+
+          ============================================
+
+    - name: Ensure game directories exist
+      win_file:
+        path: "{{ item }}"
+        state: directory
+      loop:
+        - "{{ local_base }}\\rips\\games"
+        - "{{ local_base }}\\rips\\games\\PS2"
+        - "{{ local_base }}\\rips\\games\\PS3"
+        - "{{ local_base }}\\rips\\games\\PS4"
+        - "{{ local_base }}\\rips\\games\\PS5"
+        - "{{ local_base }}\\rips\\games\\PSP"
+        - "{{ local_base }}\\rips\\games\\Xbox"
+        - "{{ local_base }}\\rips\\games\\Xbox360"
+        - "{{ local_base }}\\rips\\games\\XboxOne"
+        - "{{ local_base }}\\rips\\games\\Wii"
+        - "{{ local_base }}\\rips\\games\\GameCube"
+        - "{{ local_base }}\\rips\\games\\PC"
+
+    - name: Deploy enhanced optical drive monitoring script (with game support)
+      win_copy:
+        src: ../../files/Watch-OpticalDrives-Games.ps1
+        dest: "{{ scripts_dir }}\\Watch-OpticalDrives-Games.ps1"
+
+    - name: Check if dd for Windows is installed
+      win_stat:
+        path: "{{ dd_path }}"
+      register: dd_check
+
+    - name: Check if ImgBurn is installed
+      win_stat:
+        path: "{{ imgburn_path }}"
+      register: imgburn_check
+
+    - name: Display ISO tool status
+      debug:
+        msg: |
+          ISO Creation Tools Status:
+          - dd for Windows: {{ 'FOUND' if dd_check.stat.exists else 'NOT FOUND' }}
+          - ImgBurn: {{ 'FOUND' if imgburn_check.stat.exists else 'NOT FOUND' }}
+
+          {% if not dd_check.stat.exists and not imgburn_check.stat.exists %}
+          ⚠️  WARNING: No ISO creation tool found!
+
+          Video game ISO backup will not work without one of these tools.
+
+          Please install one of:
+          1. dd for Windows (recommended): https://chrysocome.net/dd
+             Extract dd.exe to: {{ dd_path }}
+
+          2. ImgBurn: https://www.imgburn.com/
+             Install to default location
+          {% elif dd_check.stat.exists %}
+          ✅ dd for Windows found - Video game ISO backup ready!
+          {% else %}
+          ✅ ImgBurn found - Video game ISO backup ready!
+          {% endif %}
+
+    - name: Stop existing optical monitoring service
+      win_shell: |
+        Get-Process -Name powershell -ErrorAction SilentlyContinue |
+            Where-Object {$_.CommandLine -like "*Watch-Optical*"} |
+            Stop-Process -Force -ErrorAction SilentlyContinue
+      ignore_errors: yes
+
+    - name: Remove old optical monitoring scheduled task
+      win_scheduled_task:
+        name: "Media Ingestion - Optical Monitor (Fixed)"
+        state: absent
+      ignore_errors: yes
+
+    - name: Create scheduled task - Enhanced optical monitoring (with games)
+      win_scheduled_task:
+        name: "Media Ingestion - Optical Monitor (Games)"
+        description: "Monitors optical drives for DVD/Blu-ray/CD/Games with concurrency limits"
+        actions:
+          - path: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+            arguments: >-
+              -ExecutionPolicy Bypass -WindowStyle Hidden -File "{{ scripts_dir }}\Watch-OpticalDrives-Games.ps1"
+              -MaxDVDRips {{ max_dvd_rips }}
+              -MaxBluRayRips {{ max_bluray_rips }}
+              -MaxCDRips {{ max_cd_rips }}
+              -MaxGameRips {{ max_game_rips }}
+              -LocalRipBase "{{ local_base }}\rips"
+              -LogsDir "{{ logs_dir }}"
+              -MakeMKVPath "{{ makemkv_path }}"
+              -dBpowerampPath "{{ dbpoweramp_path }}"
+              -ddPath "{{ dd_path }}"
+              -ImgBurnPath "{{ imgburn_path }}"
+        triggers:
+          - type: boot
+            delay: PT30S
+        username: SYSTEM
+        run_level: highest
+        enabled: yes
+        state: present
+
+    - name: Start enhanced optical monitoring service
+      win_shell: |
+        Start-ScheduledTask -TaskName "Media Ingestion - Optical Monitor (Games)"
+      ignore_errors: yes
+
+    - name: Deployment summary
+      debug:
+        msg: |
+          ============================================
+          VIDEO GAME ISO BACKUP DEPLOYMENT COMPLETE!
+          ============================================
+
+          ✅ SCRIPT DEPLOYED:
+          - Watch-OpticalDrives-Games.ps1 → {{ scripts_dir }}
+
+          ✅ DIRECTORIES CREATED:
+          - {{ local_base }}\rips\games\<Platform>\
+
+          ✅ SCHEDULED TASK:
+          - Name: "Media Ingestion - Optical Monitor (Games)"
+          - Status: Started
+          - Trigger: At boot (30 second delay)
+          - User: SYSTEM
+
+          ✅ SUPPORTED PLATFORMS:
+          - PlayStation: PS2, PS3, PS4, PS5, PSP
+          - Xbox: Original, 360, One
+          - Nintendo: Wii, GameCube
+          - PC Games
+
+          ✅ ISO TOOLS:
+          - dd: {{ 'READY' if dd_check.stat.exists else 'NOT INSTALLED' }}
+          - ImgBurn: {{ 'READY' if imgburn_check.stat.exists else 'NOT INSTALLED' }}
+
+          📋 NEXT STEPS:
+          {% if not dd_check.stat.exists and not imgburn_check.stat.exists %}
+          1. Install dd for Windows or ImgBurn (see above)
+          2. Re-run this playbook to verify
+          3. Insert a game disc to test
+          {% else %}
+          1. Insert a video game disc into any optical drive
+          2. Script will detect platform and create ISO automatically
+          3. Check logs: {{ logs_dir }}\optical-monitor.log
+          4. ISOs saved to: {{ local_base }}\rips\games\<Platform>\
+          {% endif %}
+
+          📖 DOCUMENTATION:
+          - See VIDEO-GAME-ISO-BACKUP-GUIDE.md for complete usage guide
+
+          🔍 MONITORING:
+          - Logs: {{ logs_dir }}\optical-monitor.log
+          - Inventory: {{ logs_dir }}\disc-inventory.log
+          - Status: Get-ScheduledTask -TaskName "*Optical*"
+
+          ============================================

@@ -1,0 +1,74 @@
+---
+- name: Mount Windows SMB share on media-server (simple version)
+  hosts: media-server
+  gather_facts: false
+
+  vars:
+    windows_host: "192.168.1.80"
+    share_name: "MediaProcessing"
+    smb_share: "//{{ windows_host }}/{{ share_name }}"
+    mount_point: "/mnt/windows-media"
+
+  tasks:
+    - name: Display mount information
+      debug:
+        msg:
+          - "=== Mounting Windows SMB Share ==="
+          - "Source: {{ smb_share }}"
+          - "Destination: {{ mount_point }}"
+
+    - name: Install CIFS utilities
+      shell: |
+        sudo apt-get update > /dev/null 2>&1
+        sudo apt-get install -y cifs-utils
+      register: install_result
+      changed_when: false
+
+    - name: Create mount directory
+      shell: sudo mkdir -p {{ mount_point }}
+      args:
+        creates: "{{ mount_point }}"
+
+    - name: Create credentials file
+      shell: |
+        echo "username=jluczani" | sudo tee /root/.smbcredentials > /dev/null
+        echo "password=password" | sudo tee -a /root/.smbcredentials > /dev/null
+        sudo chmod 600 /root/.smbcredentials
+      no_log: false
+
+    - name: Check if already mounted
+      shell: mount | grep '{{ mount_point }}'
+      register: mount_check
+      failed_when: false
+      changed_when: false
+
+    - name: Mount SMB share
+      shell: |
+        sudo mount -t cifs '{{ smb_share }}' '{{ mount_point }}' -o credentials=/root/.smbcredentials,uid=1000,gid=1000,vers=3.0
+      when: mount_check.rc != 0
+
+    - name: Add to fstab
+      shell: |
+        grep -q '{{ mount_point }}' /etc/fstab || echo '{{ smb_share }} {{ mount_point }} cifs credentials=/root/.smbcredentials,uid=1000,gid=1000,vers=3.0,_netdev,nofail 0 0' | sudo tee -a /etc/fstab
+
+    - name: Verify mount
+      shell: ls -la {{ mount_point }}
+      register: verify
+
+    - name: Display mounted directories
+      debug:
+        msg: "{{ verify.stdout_lines }}"
+
+    - name: Show *arr import paths
+      debug:
+        msg:
+          - ""
+          - "✅ Mount successful! Use these paths in *arr apps:"
+          - ""
+          - "📁 Movies (encoded): {{ mount_point }}/encoded/movies"
+          - "📁 TV (encoded):     {{ mount_point }}/encoded/tv"
+          - "📁 Music (encoded):  {{ mount_point }}/encoded/music"
+          - ""
+          - "🎬 Radarr: http://192.168.1.83:7878 → Library → Manual Import"
+          - "📺 Sonarr: http://192.168.1.83:8989 → Library → Manual Import"
+          - "🎵 Lidarr-Lossless: http://192.168.1.83:8687 → Library → Manual Import"

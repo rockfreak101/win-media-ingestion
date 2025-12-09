@@ -1,0 +1,24 @@
+# Ansible
+*.retry
+ansible/inventory/group_vars/all/vault.yml
+
+# Windows
+Thumbs.db
+*.lnk
+
+# Logs
+*.log
+
+# Sensitive config
+credentials.json
+*_backup_*.yml
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
