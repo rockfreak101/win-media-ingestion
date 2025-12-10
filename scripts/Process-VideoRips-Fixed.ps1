@@ -9,7 +9,11 @@ param(
     [string]$WatchPath = "C:\MediaProcessing\rips\video",
     [string]$EncodedBase = "C:\MediaProcessing\Encoding",
     [string]$FFmpegPath = "C:\ffmpeg\bin\ffmpeg.exe",
-    [int]$PollIntervalSeconds = 30
+    [int]$PollIntervalSeconds = 30,
+    [bool]$UseSMB = $false,
+    [string]$SmbPath = "\\10.0.0.1\media\Movies_Encoded",
+    [string]$SmbUser = "jluczani",
+    [string]$SmbPassword = $null
 )
 
 $LogFile = "C:\Scripts\Logs\video-processing.log"
@@ -61,10 +65,11 @@ function Invoke-FFmpegEncode {
     Write-Log "FFmpeg command: $FFmpegPath $($Arguments -join ' ')"
 
     try {
-        # Start-Process will handle argument quoting automatically
-        $Process = Start-Process -FilePath $FFmpegPath -ArgumentList $Arguments -NoNewWindow -PassThru -Wait
+        # Run FFmpeg and capture output/exit code for better diagnostics
+        $ffmpegOutput = & $FFmpegPath @Arguments 2>&1
+        $exitCode = $LASTEXITCODE
 
-        if ($Process.ExitCode -eq 0) {
+        if ($exitCode -eq 0) {
             Write-Log "Encoding completed successfully (AMD hardware acceleration)" -Level "SUCCESS"
 
             # Show file sizes for comparison
@@ -77,8 +82,12 @@ function Invoke-FFmpegEncode {
 
             return $true
         } else {
-            Write-Log "Encoding failed with exit code: $($Process.ExitCode)" -Level "ERROR"
-            Write-Log "Check if AMD GPU drivers are up to date" -Level "WARNING"
+            Write-Log "Encoding failed with exit code: $exitCode" -Level "ERROR"
+            if ($ffmpegOutput) {
+                $LastLines = ($ffmpegOutput | Select-Object -Last 10) -join "; "
+                Write-Log "FFmpeg output (last lines): $LastLines" -Level "ERROR"
+            }
+            Write-Log "Check AMD GPU drivers and output path access" -Level "WARNING"
             return $false
         }
     } catch {
@@ -118,6 +127,34 @@ function Get-EncodedOutputPath {
     }
 }
 
+function Ensure-SmbSession {
+    param(
+        [string]$Path,
+        [string]$User,
+        [string]$Password
+    )
+
+    if (-not $User -or -not $Password) {
+        Write-Log "SMB credentials missing; cannot mount $Path" -Level "ERROR"
+        return $false
+    }
+
+    try {
+        # Establish UNC session without drive letter
+        & net use $Path $Password /user:$User | Out-Null
+        if (Test-Path $Path) {
+            Write-Log "SMB session established for $Path" -Level "SUCCESS"
+            return $true
+        }
+
+        Write-Log "SMB session attempt did not validate access to $Path" -Level "ERROR"
+        return $false
+    } catch {
+        Write-Log "SMB session setup failed: $($_.Exception.Message)" -Level "ERROR"
+        return $false
+    }
+}
+
 Write-Log "============================================" -Level "SUCCESS"
 Write-Log "Video Processing Monitor Started" -Level "SUCCESS"
 Write-Log "============================================" -Level "SUCCESS"
@@ -127,6 +164,16 @@ Write-Log "Encoder: FFmpeg with AMD AMF AV1 (hardware accelerated)"
 Write-Log "FFmpeg path: $FFmpegPath"
 Write-Log "Poll interval: $PollIntervalSeconds seconds"
 Write-Log "Directory structure: PRESERVED from source"
+
+# Establish SMB session and override output base when requested
+if ($UseSMB) {
+    if (-not (Ensure-SmbSession -Path $SmbPath -User $SmbUser -Password $SmbPassword)) {
+        Write-Log "Exiting because SMB session could not be established for $SmbPath" -Level "ERROR"
+        exit 1
+    }
+    $EncodedBase = $SmbPath
+    Write-Log "Using SMB output path: $EncodedBase" -Level "INFO"
+}
 
 # Verify FFmpeg exists
 if (-not (Test-Path $FFmpegPath)) {
