@@ -4,6 +4,7 @@
 # - Preserves source directory structure in encoded output
 # - Uses C:\MediaProcessing\Encoding\ instead of final\
 # - Fixed FFmpeg argument handling
+# - 2025-12-11: Switched from CQP to VBR mode to prevent file size increases
 
 param(
     [string]$WatchPath = "C:\MediaProcessing\rips\video",
@@ -50,9 +51,10 @@ function Invoke-FFmpegEncode {
         "-i", $InputFile,          # Input file (NO quotes here)
         "-c:v", "av1_amf",         # AMD AMF AV1 hardware encoder
         "-quality", "balanced",     # Balanced quality/speed mode
-        "-rc", "cqp",              # Constant Quality mode
-        "-qp_i", "26",             # I-frame quality (26 = very good)
-        "-qp_p", "28",             # P-frame quality
+        "-rc", "vbr_peak",         # Peak Constrained VBR (fixes file size increase bug)
+        "-b:v", "2.5M",            # Target bitrate (good quality, reasonable size)
+        "-maxrate", "5M",          # Maximum bitrate peak
+        "-bufsize", "10M",         # Buffer size for rate control
         "-usage", "transcoding",   # Optimize for transcoding
         "-pix_fmt", "yuv420p",     # Standard color format
         "-map", "0",               # Map all streams
@@ -161,6 +163,7 @@ Write-Log "============================================" -Level "SUCCESS"
 Write-Log "Watch path: $WatchPath"
 Write-Log "Encoded base: $EncodedBase"
 Write-Log "Encoder: FFmpeg with AMD AMF AV1 (hardware accelerated)"
+Write-Log "Rate control: VBR (2.5 Mbps target, 5 Mbps max)"
 Write-Log "FFmpeg path: $FFmpegPath"
 Write-Log "Poll interval: $PollIntervalSeconds seconds"
 Write-Log "Directory structure: PRESERVED from source"
