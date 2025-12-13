@@ -5,6 +5,7 @@
 # - Uses C:\MediaProcessing\Encoding\ instead of final\
 # - Fixed FFmpeg argument handling
 # - 2025-12-11: Switched from CQP to VBR mode to prevent file size increases
+# - 2025-12-12: Use local encoding workflow to prevent SMB crashes
 
 param(
     [string]$WatchPath = "C:\MediaProcessing\rips\video",
@@ -39,10 +40,15 @@ function Get-VideoFiles {
 function Invoke-FFmpegEncode {
     param(
         [string]$InputFile,
-        [string]$OutputFile
+        [string]$LocalOutputFile,
+        [string]$FinalOutputFile = $null  # SMB destination (optional)
     )
 
-    Write-Log "Encoding with AMD AMF: $InputFile -> $OutputFile"
+    Write-Log "Encoding with AMD AMF: $InputFile"
+    Write-Log "  Local output:  $LocalOutputFile"
+    if ($FinalOutputFile) {
+        Write-Log "  Final output:  $FinalOutputFile (will move after encoding)"
+    }
 
     # Create FFmpeg argument array (no quotes in array elements)
     $Arguments = @(
@@ -60,7 +66,7 @@ function Invoke-FFmpegEncode {
         "-map", "0",               # Map all streams
         "-c:a", "copy",            # Copy audio streams
         "-c:s", "copy",            # Copy subtitle streams
-        $OutputFile                # Output file (NO quotes here)
+        $LocalOutputFile           # Encode to LOCAL disk (fast, no SMB)
     )
 
     # Log command for debugging (show what will be executed)
@@ -75,11 +81,33 @@ function Invoke-FFmpegEncode {
             Write-Log "Encoding completed successfully (AMD hardware acceleration)" -Level "SUCCESS"
 
             # Show file sizes for comparison
-            if (Test-Path $OutputFile) {
+            if (Test-Path $LocalOutputFile) {
                 $InputSize = (Get-Item $InputFile).Length / 1GB
-                $OutputSize = (Get-Item $OutputFile).Length / 1GB
+                $OutputSize = (Get-Item $LocalOutputFile).Length / 1GB
                 $Reduction = [math]::Round((($InputSize - $OutputSize) / $InputSize) * 100, 1)
                 Write-Log "Size: $([math]::Round($InputSize, 2))GB -> $([math]::Round($OutputSize, 2))GB ($Reduction% reduction)" -Level "SUCCESS"
+            }
+
+            # If SMB destination specified, move file there
+            if ($FinalOutputFile) {
+                try {
+                    Write-Log "Moving encoded file to SMB: $FinalOutputFile" -Level "PROGRESS"
+
+                    # Ensure destination directory exists
+                    $FinalDir = Split-Path -Path $FinalOutputFile -Parent
+                    if (-not (Test-Path $FinalDir)) {
+                        New-Item -ItemType Directory -Path $FinalDir -Force | Out-Null
+                        Write-Log "Created SMB directory: $FinalDir"
+                    }
+
+                    # Move to SMB
+                    Move-Item -Path $LocalOutputFile -Destination $FinalOutputFile -Force
+                    Write-Log "Moved to SMB successfully" -Level "SUCCESS"
+                } catch {
+                    Write-Log "ERROR: Failed to move to SMB - $($_.Exception.Message)" -Level "ERROR"
+                    Write-Log "Encoded file remains at: $LocalOutputFile" -Level "WARNING"
+                    return $false
+                }
             }
 
             return $true
@@ -161,21 +189,23 @@ Write-Log "============================================" -Level "SUCCESS"
 Write-Log "Video Processing Monitor Started" -Level "SUCCESS"
 Write-Log "============================================" -Level "SUCCESS"
 Write-Log "Watch path: $WatchPath"
-Write-Log "Encoded base: $EncodedBase"
+Write-Log "Local encoded base: $EncodedBase (always encode here first)"
 Write-Log "Encoder: FFmpeg with AMD AMF AV1 (hardware accelerated)"
 Write-Log "Rate control: VBR (2.5 Mbps target, 5 Mbps max)"
 Write-Log "FFmpeg path: $FFmpegPath"
 Write-Log "Poll interval: $PollIntervalSeconds seconds"
 Write-Log "Directory structure: PRESERVED from source"
 
-# Establish SMB session and override output base when requested
+# Establish SMB session if requested (files will be moved to SMB after local encoding)
 if ($UseSMB) {
     if (-not (Ensure-SmbSession -Path $SmbPath -User $SmbUser -Password $SmbPassword)) {
-        Write-Log "Exiting because SMB session could not be established for $SmbPath" -Level "ERROR"
-        exit 1
+        Write-Log "WARNING: SMB session could not be established for $SmbPath" -Level "WARNING"
+        Write-Log "Will encode locally but cannot move to SMB" -Level "WARNING"
+        $UseSMB = $false
+    } else {
+        Write-Log "SMB session established: $SmbPath" -Level "SUCCESS"
+        Write-Log "Workflow: Encode local -> Move to SMB" -Level "INFO"
     }
-    $EncodedBase = $SmbPath
-    Write-Log "Using SMB output path: $EncodedBase" -Level "INFO"
 }
 
 # Verify FFmpeg exists
@@ -202,18 +232,27 @@ while ($true) {
     }
 
     foreach ($File in $VideoFiles) {
-        # Get output path preserving directory structure
-        $OutputFile = Get-EncodedOutputPath -SourceFile $File
+        # Get LOCAL output path preserving directory structure
+        $LocalOutputFile = Get-EncodedOutputPath -SourceFile $File
 
-        # Ensure output directory exists
-        $OutputDir = Split-Path -Path $OutputFile -Parent
-        if (-not (Test-Path $OutputDir)) {
-            New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
-            Write-Log "Created output directory: $OutputDir"
+        # Ensure LOCAL output directory exists
+        $LocalOutputDir = Split-Path -Path $LocalOutputFile -Parent
+        if (-not (Test-Path $LocalOutputDir)) {
+            New-Item -ItemType Directory -Path $LocalOutputDir -Force | Out-Null
+            Write-Log "Created local output directory: $LocalOutputDir"
         }
 
-        # Encode
-        $Success = Invoke-FFmpegEncode -InputFile $File.FullName -OutputFile $OutputFile
+        # Calculate SMB destination path if needed
+        $SmbOutputFile = $null
+        if ($UseSMB) {
+            # Replace local base with SMB base in the path
+            # Example: C:\MediaProcessing\Encoding\movies\file.mkv -> \\10.0.0.1\media\Movies_Encoded\movies\file.mkv
+            $RelativePath = $LocalOutputFile.Substring($EncodedBase.Length).TrimStart('\')
+            $SmbOutputFile = Join-Path $SmbPath $RelativePath
+        }
+
+        # Encode (always to local first, optionally move to SMB)
+        $Success = Invoke-FFmpegEncode -InputFile $File.FullName -LocalOutputFile $LocalOutputFile -FinalOutputFile $SmbOutputFile
 
         if ($Success) {
             # Delete original rip after successful encode
