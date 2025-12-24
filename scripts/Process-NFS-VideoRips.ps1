@@ -2,13 +2,15 @@
 # Watches NFS/SMB shares for video files, downloads to local, encodes, uploads back
 # Workflow:
 #   1. Watch NFS shares (More_Movies, TV) for MKV/M2TS files
-#   2. Download file to local F: drive
-#   3. Encode locally with AMD AMF AV1
-#   4. Upload encoded file to appropriate NFS destination (Movies_Encoded or TV_Encoded)
-#   5. Delete original from NFS and both local copies
+#   2. Check if file is already compressed (H.265/HEVC, AV1, VP9) - skip if so
+#   3. Download file to local F: drive
+#   4. Encode locally with AMD AMF AV1
+#   5. Upload encoded file to appropriate NFS destination (Movies_Encoded or TV_Encoded)
+#   6. Delete original from NFS and both local copies
 #
 # 2025-12-23: Initial creation - NFS pull/encode/push workflow
 # 2025-12-23: Updated to watch More_Movies and TV folders
+# 2025-12-24: Skip already-compressed files (H.265/HEVC, AV1, VP9) and log them for review
 
 param(
     # NFS/SMB base path (10Gb network) - this is the SMB share
@@ -29,6 +31,7 @@ param(
 
     # FFmpeg settings
     [string]$FFmpegPath = "C:\ffmpeg\bin\ffmpeg.exe",
+    [string]$FFprobePath = "C:\ffmpeg\bin\ffprobe.exe",
 
     # Timing
     [int]$PollIntervalSeconds = 60,
@@ -40,6 +43,10 @@ param(
 )
 
 $LogFile = "C:\Scripts\Logs\nfs-video-processing.log"
+$SkippedFilesLog = "C:\Scripts\Logs\nfs-skipped-already-compressed.log"
+
+# Codecs that are considered "already compressed" and should be skipped
+$CompressedCodecs = @("hevc", "h265", "av1", "vp9")
 
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
@@ -54,6 +61,82 @@ function Write-Log {
 
     $LogMessage | Add-Content -Path $LogFile
     Write-Host $LogMessage
+}
+
+function Write-SkippedFile {
+    param(
+        [string]$FilePath,
+        [string]$Codec,
+        [double]$SizeGB,
+        [string]$Reason
+    )
+    $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $LogEntry = "$Timestamp | $Codec | $([math]::Round($SizeGB, 2)) GB | $Reason | $FilePath"
+
+    # Ensure log directory exists
+    $LogDir = Split-Path -Path $SkippedFilesLog -Parent
+    if (-not (Test-Path $LogDir)) {
+        New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+    }
+
+    $LogEntry | Add-Content -Path $SkippedFilesLog
+    Write-Log "SKIPPED (already $Codec): $FilePath" -Level "SKIP"
+}
+
+function Test-AlreadyCompressed {
+    <#
+    .SYNOPSIS
+    Checks if a video file is already encoded with an efficient codec (H.265/HEVC, AV1, VP9).
+
+    .DESCRIPTION
+    Uses ffprobe to detect the video codec. Files already compressed with modern codecs
+    would likely increase in size if re-encoded, so they should be skipped.
+
+    .RETURNS
+    Returns a hashtable with 'IsCompressed' boolean and 'Codec' string, or $null on error.
+    #>
+    param([string]$FilePath)
+
+    try {
+        # Use ffprobe to get video codec
+        $ffprobeArgs = @(
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=codec_name",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            "`"$FilePath`""
+        ) -join ' '
+
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $FFprobePath
+        $psi.Arguments = $ffprobeArgs
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.CreateNoWindow = $true
+
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $psi
+        $process.Start() | Out-Null
+
+        $codec = $process.StandardOutput.ReadToEnd().Trim().ToLower()
+        $process.WaitForExit()
+
+        if ($process.ExitCode -ne 0 -or [string]::IsNullOrEmpty($codec)) {
+            Write-Log "Could not detect codec for: $FilePath" -Level "WARNING"
+            return $null
+        }
+
+        $isCompressed = $CompressedCodecs -contains $codec
+
+        return @{
+            IsCompressed = $isCompressed
+            Codec = $codec
+        }
+    } catch {
+        Write-Log "ffprobe error for $FilePath : $($_.Exception.Message)" -Level "ERROR"
+        return $null
+    }
 }
 
 function Ensure-SmbSession {
@@ -386,8 +469,10 @@ Write-Log "Local Encoded: $LocalEncodedPath"
 Write-Log "Encoder: FFmpeg AMD AMF AV1 (6 Mbps target, 10 Mbps max)"
 Write-Log "Min file size: $MinFileSizeMB MB"
 Write-Log "Poll interval: $PollIntervalSeconds seconds"
+Write-Log "Skip codecs: $($CompressedCodecs -join ', ') (already compressed)"
+Write-Log "Skipped files log: $SkippedFilesLog"
 Write-Log ""
-Write-Log "Workflow: Download from NFS -> Encode local -> Upload to NFS -> Cleanup"
+Write-Log "Workflow: Check codec -> Download from NFS -> Encode local -> Upload to NFS -> Cleanup"
 
 # Ensure local directories exist
 foreach ($dir in @($LocalDownloadPath, $LocalEncodedPath)) {
@@ -425,9 +510,20 @@ while ($true) {
         }
 
         $mediaType = Get-MediaType -SourcePath $File.FullName
+        $fileSizeGB = $File.Length / 1GB
+
+        # Check if file is already compressed with efficient codec
+        $codecCheck = Test-AlreadyCompressed -FilePath $File.FullName
+        if ($codecCheck -and $codecCheck.IsCompressed) {
+            Write-SkippedFile -FilePath $File.FullName -Codec $codecCheck.Codec -SizeGB $fileSizeGB -Reason "Already compressed - would increase in size"
+            continue
+        }
+
+        # Log the detected codec for files we will process
+        $codecInfo = if ($codecCheck) { " [Source: $($codecCheck.Codec)]" } else { "" }
 
         Write-Log "========================================" -Level "SUCCESS"
-        Write-Log "Processing [$mediaType]: $($File.Name) ($([math]::Round($File.Length/1GB, 2)) GB)" -Level "SUCCESS"
+        Write-Log "Processing [$mediaType]: $($File.Name) ($([math]::Round($fileSizeGB, 2)) GB)$codecInfo" -Level "SUCCESS"
         Write-Log "Source: $($File.DirectoryName)" -Level "INFO"
         Write-Log "========================================" -Level "SUCCESS"
 
