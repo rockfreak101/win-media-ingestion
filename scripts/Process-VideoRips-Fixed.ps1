@@ -8,6 +8,7 @@
 # - 2025-12-12: Use local encoding workflow to prevent SMB crashes
 # - 2025-12-14: Added file readiness check to wait for MakeMKV to finish writing
 # - 2025-12-23: Set FFmpeg to High priority for better encoding performance
+# - 2025-12-23: Quality priority bitrate (6 Mbps target, 10 Mbps max)
 
 param(
     [string]$WatchPath = "C:\MediaProcessing\rips\video",
@@ -114,9 +115,9 @@ function Invoke-FFmpegEncode {
         "-c:v", "av1_amf",         # AMD AMF AV1 hardware encoder
         "-quality", "balanced",     # Balanced quality/speed mode
         "-rc", "vbr_peak",         # Peak Constrained VBR (fixes file size increase bug)
-        "-b:v", "2.5M",            # Target bitrate (good quality, reasonable size)
-        "-maxrate", "5M",          # Maximum bitrate peak
-        "-bufsize", "10M",         # Buffer size for rate control
+        "-b:v", "6M",              # Quality priority: 6 Mbps target
+        "-maxrate", "10M",         # Quality priority: 10 Mbps max
+        "-bufsize", "20M",         # Larger buffer for quality
         "-usage", "transcoding",   # Optimize for transcoding
         "-pix_fmt", "yuv420p",     # Standard color format
         "-map", "0",               # Map all streams
@@ -138,9 +139,9 @@ function Invoke-FFmpegEncode {
             "-c:v", "av1_amf",
             "-quality", "balanced",
             "-rc", "vbr_peak",
-            "-b:v", "2.5M",
-            "-maxrate", "5M",
-            "-bufsize", "10M",
+            "-b:v", "6M",               # Quality priority: 6 Mbps target
+            "-maxrate", "10M",          # Quality priority: 10 Mbps max
+            "-bufsize", "20M",          # Larger buffer for quality
             "-usage", "transcoding",
             "-pix_fmt", "yuv420p",
             "-map", "0",
@@ -289,7 +290,7 @@ Write-Log "============================================" -Level "SUCCESS"
 Write-Log "Watch path: $WatchPath"
 Write-Log "Local encoded base: $EncodedBase (always encode here first)"
 Write-Log "Encoder: FFmpeg with AMD AMF AV1 (hardware accelerated)"
-Write-Log "Rate control: VBR (2.5 Mbps target, 5 Mbps max)"
+Write-Log "Rate control: VBR Quality Priority (6 Mbps target, 10 Mbps max)"
 Write-Log "FFmpeg path: $FFmpegPath"
 Write-Log "Poll interval: $PollIntervalSeconds seconds"
 Write-Log "File ready age: $FileReadyAgeSeconds seconds (wait after last write)"
