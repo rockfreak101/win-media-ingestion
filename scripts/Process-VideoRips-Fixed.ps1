@@ -7,6 +7,7 @@
 # - 2025-12-11: Switched from CQP to VBR mode to prevent file size increases
 # - 2025-12-12: Use local encoding workflow to prevent SMB crashes
 # - 2025-12-14: Added file readiness check to wait for MakeMKV to finish writing
+# - 2025-12-23: Set FFmpeg to High priority for better encoding performance
 
 param(
     [string]$WatchPath = "C:\MediaProcessing\rips\video",
@@ -128,9 +129,51 @@ function Invoke-FFmpegEncode {
     Write-Log "FFmpeg command: $FFmpegPath $($Arguments -join ' ')"
 
     try {
-        # Run FFmpeg and capture output/exit code for better diagnostics
-        $ffmpegOutput = & $FFmpegPath @Arguments 2>&1
-        $exitCode = $LASTEXITCODE
+        # Start FFmpeg as a process so we can set High priority for better performance
+        # Build argument string with proper quoting for paths with spaces/special chars
+        $QuotedArgs = @(
+            "-hide_banner",
+            "-y",
+            "-i", "`"$InputFile`"",     # Quote input path
+            "-c:v", "av1_amf",
+            "-quality", "balanced",
+            "-rc", "vbr_peak",
+            "-b:v", "2.5M",
+            "-maxrate", "5M",
+            "-bufsize", "10M",
+            "-usage", "transcoding",
+            "-pix_fmt", "yuv420p",
+            "-map", "0",
+            "-c:a", "copy",
+            "-c:s", "copy",
+            "`"$LocalOutputFile`""      # Quote output path
+        )
+        $ArgumentString = $QuotedArgs -join ' '
+
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $FFmpegPath
+        $psi.Arguments = $ArgumentString
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardError = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.CreateNoWindow = $true
+
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $psi
+        $process.Start() | Out-Null
+
+        # Set High priority for better encoding performance
+        try {
+            $process.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::High
+            Write-Log "FFmpeg process started with High priority (PID: $($process.Id))"
+        } catch {
+            Write-Log "Could not set High priority: $($_.Exception.Message)" -Level "WARNING"
+        }
+
+        # Wait for completion and capture output
+        $ffmpegOutput = $process.StandardError.ReadToEnd()
+        $process.WaitForExit()
+        $exitCode = $process.ExitCode
 
         if ($exitCode -eq 0) {
             Write-Log "Encoding completed successfully (AMD hardware acceleration)" -Level "SUCCESS"
