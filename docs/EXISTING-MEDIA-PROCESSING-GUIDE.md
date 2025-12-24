@@ -121,8 +121,8 @@ volumes:
     driver: local
     driver_opts:
       type: cifs
-      o: "addr=192.168.1.80,username=jluczani,password=${WIN_PASSWORD},uid=1000,gid=1000"
-      device: "//192.168.1.80/MediaProcessing/encoded/movies"
+      o: "addr=192.168.2.96,username=jluczani,password=${WIN_PASSWORD},uid=1000,gid=1000"
+      device: "//192.168.2.96/MediaProcessing/encoded/movies"
 ```
 
 Create `.env` file:

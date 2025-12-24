@@ -5,7 +5,7 @@
 
   vars:
     # SMB share path on media-server
-    smb_share_base: "//192.168.1.80/MediaProcessing"
+    smb_share_base: "//192.168.2.96/MediaProcessing"
     smb_mount_base: "/mnt/win-media-ingest"
 
     # FileBot output paths (as seen from media-server via SMB)

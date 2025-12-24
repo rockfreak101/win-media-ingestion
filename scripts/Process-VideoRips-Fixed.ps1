@@ -6,12 +6,15 @@
 # - Fixed FFmpeg argument handling
 # - 2025-12-11: Switched from CQP to VBR mode to prevent file size increases
 # - 2025-12-12: Use local encoding workflow to prevent SMB crashes
+# - 2025-12-14: Added file readiness check to wait for MakeMKV to finish writing
 
 param(
     [string]$WatchPath = "C:\MediaProcessing\rips\video",
     [string]$EncodedBase = "C:\MediaProcessing\Encoding",
     [string]$FFmpegPath = "C:\ffmpeg\bin\ffmpeg.exe",
     [int]$PollIntervalSeconds = 30,
+    [int]$FileReadyAgeSeconds = 10,       # Minimum seconds since last write before processing
+    [int]$FileSizeCheckWaitSeconds = 3,   # Seconds to wait between file size checks
     [bool]$UseSMB = $false,
     [string]$SmbPath = "\\10.0.0.1\media\Movies_Encoded",
     [string]$SmbUser = "jluczani",
@@ -26,6 +29,58 @@ function Write-Log {
     $LogMessage = "$Timestamp [$Level] $Message"
     $LogMessage | Add-Content -Path $LogFile
     Write-Host $LogMessage
+}
+
+function Test-FileReady {
+    <#
+    .SYNOPSIS
+    Checks if a file is ready for processing (not locked by another process like MakeMKV).
+
+    .DESCRIPTION
+    Performs three checks:
+    1. File age check - ensures minimum time since last modification
+    2. File lock check - tries to open the file for read access
+    3. File size stability check - ensures file size is not changing (still being written)
+
+    This prevents attempting to encode files that MakeMKV is still writing.
+    #>
+    param(
+        [System.IO.FileInfo]$File
+    )
+
+    # Check 1: File age - must be at least $FileReadyAgeSeconds old
+    $FileAge = (Get-Date) - $File.LastWriteTime
+    if ($FileAge.TotalSeconds -lt $FileReadyAgeSeconds) {
+        Write-Log "  File too new (age: $([math]::Round($FileAge.TotalSeconds, 1))s < ${FileReadyAgeSeconds}s): $($File.Name)" -Level "DEBUG"
+        return $false
+    }
+
+    # Check 2: Try to open file for read access (detects exclusive locks)
+    try {
+        $stream = [System.IO.File]::Open($File.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $stream.Close()
+        $stream.Dispose()
+    } catch {
+        Write-Log "  File locked by another process (MakeMKV?): $($File.Name)" -Level "DEBUG"
+        return $false
+    }
+
+    # Check 3: File size stability - ensure file is not actively being written
+    $InitialSize = $File.Length
+    Start-Sleep -Seconds $FileSizeCheckWaitSeconds
+
+    # Refresh file info to get current size
+    $File.Refresh()
+    $CurrentSize = $File.Length
+
+    if ($InitialSize -ne $CurrentSize) {
+        $SizeDiff = $CurrentSize - $InitialSize
+        Write-Log "  File still being written (size changed by $([math]::Round($SizeDiff / 1MB, 2)) MB): $($File.Name)" -Level "DEBUG"
+        return $false
+    }
+
+    # All checks passed - file is ready
+    return $true
 }
 
 function Get-VideoFiles {
@@ -194,6 +249,8 @@ Write-Log "Encoder: FFmpeg with AMD AMF AV1 (hardware accelerated)"
 Write-Log "Rate control: VBR (2.5 Mbps target, 5 Mbps max)"
 Write-Log "FFmpeg path: $FFmpegPath"
 Write-Log "Poll interval: $PollIntervalSeconds seconds"
+Write-Log "File ready age: $FileReadyAgeSeconds seconds (wait after last write)"
+Write-Log "File size check wait: $FileSizeCheckWaitSeconds seconds"
 Write-Log "Directory structure: PRESERVED from source"
 
 # Establish SMB session if requested (files will be moved to SMB after local encoding)
@@ -228,10 +285,18 @@ while ($true) {
     $VideoFiles = Get-VideoFiles
 
     if ($VideoFiles.Count -gt 0) {
-        Write-Log "Found $($VideoFiles.Count) video file(s) to process"
+        Write-Log "Found $($VideoFiles.Count) video file(s) to check"
     }
 
     foreach ($File in $VideoFiles) {
+        # Check if file is ready for processing (not locked by MakeMKV, not still being written)
+        if (-not (Test-FileReady -File $File)) {
+            # File is not ready - skip it this cycle, will retry on next poll
+            continue
+        }
+
+        Write-Log "File ready for encoding: $($File.Name)" -Level "SUCCESS"
+
         # Get LOCAL output path preserving directory structure
         $LocalOutputFile = Get-EncodedOutputPath -SourceFile $File
 

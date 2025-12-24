@@ -13,12 +13,12 @@ This guide configures the Linux media-server to access encoded media files from 
 ### Architecture:
 
 ```
-Windows Server (win-ingest-01 - 192.168.1.80)
+Windows Server (win-ingest-01 - 192.168.2.96)
 ├── C:\MediaProcessing\encoded\movies\    ← Radarr monitors this
 ├── C:\MediaProcessing\encoded\tv\        ← Sonarr monitors this
 └── C:\MediaProcessing\encoded\music-lossless\ ← Lidarr monitors this
           ↓
-     SMB Share: \\192.168.1.80\MediaProcessing
+     SMB Share: \\192.168.2.96\MediaProcessing
           ↓
 Linux Server (media-server - 192.168.1.83)
 ├── /mnt/win-encoded/                      ← Mount point
@@ -32,7 +32,7 @@ Linux Server (media-server - 192.168.1.83)
 ## Prerequisites
 
 **On win-ingest-01 (Windows):**
-- ✅ COMPLETED - SMB share created: `\\192.168.1.80\MediaProcessing`
+- ✅ COMPLETED - SMB share created: `\\192.168.2.96\MediaProcessing`
 - ✅ COMPLETED - Firewall rules enabled for SMB
 - ✅ COMPLETED - Permissions configured
 
@@ -101,7 +101,7 @@ sudo chown root:root /root/.smb/win-ingest-credentials
 Before adding to fstab, test the mount manually:
 
 ```bash
-sudo mount -t cifs //192.168.1.80/MediaProcessing /mnt/win-encoded \
+sudo mount -t cifs //192.168.2.96/MediaProcessing /mnt/win-encoded \
   -o credentials=/root/.smb/win-ingest-credentials,uid=1000,gid=1000,file_mode=0644,dir_mode=0755
 ```
 
@@ -133,7 +133,7 @@ sudo nano /etc/fstab
 Add this line at the end:
 
 ```
-//192.168.1.80/MediaProcessing  /mnt/win-encoded  cifs  credentials=/root/.smb/win-ingest-credentials,uid=1000,gid=1000,file_mode=0644,dir_mode=0755,_netdev,nofail  0  0
+//192.168.2.96/MediaProcessing  /mnt/win-encoded  cifs  credentials=/root/.smb/win-ingest-credentials,uid=1000,gid=1000,file_mode=0644,dir_mode=0755,_netdev,nofail  0  0
 ```
 
 **Important flags explained:**
@@ -162,7 +162,7 @@ ls -la /mnt/win-encoded/encoded/
 
 Expected output:
 ```
-//192.168.1.80/MediaProcessing on /mnt/win-encoded type cifs (rw,relatime,...)
+//192.168.2.96/MediaProcessing on /mnt/win-encoded type cifs (rw,relatime,...)
 ...
 drwxr-xr-x  2 jluczani jluczani  0 Dec  3 14:00 movies
 drwxr-xr-x  2 jluczani jluczani  0 Dec  3 14:00 tv
@@ -353,8 +353,8 @@ sudo cat /root/.smb/win-ingest-credentials
 **Solution**: Check network connectivity
 
 ```bash
-ping 192.168.1.80
-telnet 192.168.1.80 445  # Test SMB port
+ping 192.168.2.96
+telnet 192.168.2.96 445  # Test SMB port
 ```
 
 ### Issue: Can see files but permissions denied in Docker

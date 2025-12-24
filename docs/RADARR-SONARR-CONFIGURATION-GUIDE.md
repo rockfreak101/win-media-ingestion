@@ -16,7 +16,7 @@ This guide configures Radarr (movies) and Sonarr (TV shows) to automatically det
 Windows Server (win-ingest-01)
 ├── MakeMKV rips disc → C:\MediaProcessing\rips\video\movies\
 ├── FFmpeg encodes → C:\MediaProcessing\encoded\movies\
-└── SMB share exposes → \\192.168.1.80\MediaProcessing
+└── SMB share exposes → \\192.168.2.96\MediaProcessing
           ↓
 Linux Server (media-server)
 ├── CIFS mount → /mnt/win-encoded/encoded/movies/

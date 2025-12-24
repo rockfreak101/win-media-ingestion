@@ -4,7 +4,7 @@
   gather_facts: false
 
   vars:
-    windows_host: "192.168.1.80"
+    windows_host: "192.168.2.96"
     share_name: "MediaProcessing"
     smb_share: "//{{ windows_host }}/{{ share_name }}"
     mount_point: "/mnt/windows-media"

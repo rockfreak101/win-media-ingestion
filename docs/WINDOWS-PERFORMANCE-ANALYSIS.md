@@ -1,6 +1,6 @@
 ## Windows Server Performance Analysis and Optimization
 
-**Server**: win-ingest-01 (192.168.1.80)
+**Server**: win-ingest-01 (192.168.2.96)
 **Date**: 2025-12-03
 **Current Status**: High-performance configuration, running well
 

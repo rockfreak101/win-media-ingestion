@@ -9,10 +9,10 @@
 
 ### 1. Windows SMB Share (COMPLETED ✅)
 
-**Server**: win-ingest-01 (192.168.1.80)
+**Server**: win-ingest-01 (192.168.2.96)
 **Share Name**: `MediaProcessing`
 **Share Path**: `C:\MediaProcessing`
-**Access**: `\\192.168.1.80\MediaProcessing`
+**Access**: `\\192.168.2.96\MediaProcessing`
 
 #### Verification Results:
 - ✅ Share created and accessible locally
@@ -69,7 +69,7 @@ Windows Server (win-ingest-01)
 ├── Physical disc inserted
 ├── MakeMKV rips → C:\MediaProcessing\rips\video\movies\
 ├── FFmpeg encodes → C:\MediaProcessing\encoded\movies\
-└── SMB share exposes → \\192.168.1.80\MediaProcessing
+└── SMB share exposes → \\192.168.2.96\MediaProcessing
           ↓ (network share)
 Linux Server (media-server)
 ├── CIFS mount → /mnt/win-encoded/

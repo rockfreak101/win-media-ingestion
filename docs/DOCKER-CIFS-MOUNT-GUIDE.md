@@ -44,7 +44,7 @@ Create `.env` file in the same directory as `docker-compose.yml`:
 
 ```bash
 # Windows SMB credentials
-WIN_SMB_HOST=192.168.1.80
+WIN_SMB_HOST=192.168.2.96
 WIN_SMB_USER=jluczani
 WIN_SMB_PASSWORD=your_password_here
 
@@ -157,7 +157,7 @@ o: "addr=${WIN_SMB_HOST},username=${WIN_SMB_USER},password=${WIN_SMB_PASSWORD},u
 
 | Option | Value | Purpose |
 |--------|-------|---------|
-| `addr` | `192.168.1.80` | Windows server IP |
+| `addr` | `192.168.2.96` | Windows server IP |
 | `username` | `jluczani` | SMB username |
 | `password` | `***` | SMB password |
 | `uid` | `1000` | File owner UID (matches PUID) |
@@ -193,7 +193,7 @@ docker-compose down
 ```bash
 cat > .env << 'EOF'
 # Windows SMB credentials
-WIN_SMB_HOST=192.168.1.80
+WIN_SMB_HOST=192.168.2.96
 WIN_SMB_USER=jluczani
 WIN_SMB_PASSWORD=your_actual_password
 
@@ -251,7 +251,7 @@ journalctl -xe | grep -i cifs
 **Fix**:
 ```bash
 # Test SMB connectivity from Docker host
-smbclient -L //192.168.1.80 -U jluczani
+smbclient -L //192.168.2.96 -U jluczani
 ```
 
 #### "Permission denied"
@@ -294,7 +294,7 @@ docker exec radarr df -h | grep incoming-windows
 **Verify Windows share**:
 ```bash
 # From Docker host
-smbclient //192.168.1.80/MediaProcessing -U jluczani -c "ls encoded/movies/"
+smbclient //192.168.2.96/MediaProcessing -U jluczani -c "ls encoded/movies/"
 ```
 
 ---
@@ -359,7 +359,7 @@ Get-NetFirewallRule -DisplayName "*File and Printer Sharing*" | Enable-NetFirewa
 sudo apt install smbclient
 
 # Test connection
-smbclient //192.168.1.80/MediaProcessing -U jluczani
+smbclient //192.168.2.96/MediaProcessing -U jluczani
 
 # List files
 smb: \> ls encoded/movies/
@@ -379,7 +379,7 @@ volumes:
 
 ```bash
 # /etc/fstab
-//192.168.1.80/MediaProcessing/encoded/movies /mnt/win-encoded cifs credentials=/root/.smb/credentials,uid=1000,gid=1000 0 0
+//192.168.2.96/MediaProcessing/encoded/movies /mnt/win-encoded cifs credentials=/root/.smb/credentials,uid=1000,gid=1000 0 0
 ```
 
 ### After (Direct CIFS):
@@ -396,8 +396,8 @@ volumes:
     driver: local
     driver_opts:
       type: cifs
-      o: "addr=192.168.1.80,username=jluczani,password=***,..."
-      device: "//192.168.1.80/MediaProcessing/encoded/movies"
+      o: "addr=192.168.2.96,username=jluczani,password=***,..."
+      device: "//192.168.2.96/MediaProcessing/encoded/movies"
 ```
 
 **Migration steps**:
@@ -539,7 +539,7 @@ networks:
 
 **.env**:
 ```bash
-WIN_SMB_HOST=192.168.1.80
+WIN_SMB_HOST=192.168.2.96
 WIN_SMB_USER=jluczani
 WIN_SMB_PASSWORD=your_secure_password
 PUID=1000

@@ -2,7 +2,8 @@
 # Monitors optical drives with TV show multi-episode support + VIDEO GAME ISO BACKUP
 #
 # Features:
-# - Concurrency limits: 2 DVD, 1 Blu-ray, 1 CD, 1 Game ISO
+# - BluRay-only mode: Only auto-rips Blu-ray discs (DVDs are skipped)
+# - Concurrency limits: 1 Blu-ray, 1 CD, 1 Game ISO
 # - TV Shows: Rips ALL episodes (all titles >= 10 min)
 # - Movies: Rips largest title only
 # - VIDEO GAMES: Creates ISO backup of disc
@@ -15,9 +16,15 @@
 # - Creates ISO images using dd or ImgBurn
 # - Organizes by platform (PS2, PS3, PS4, Xbox, Xbox360, PC)
 # - Preserves exact disc copy for emulation
+#
+# BluRay-Only Mode (2024-12-20):
+# - DVDs are detected but NOT auto-ripped
+# - Only BluRay discs trigger automatic ripping
+# - Use -BluRayOnly:$false to enable DVD ripping
 
 param(
     [int]$PollIntervalSeconds = 5,
+    [switch]$BluRayOnly = $true,  # Only auto-rip BluRay discs (skip DVDs)
     [int]$MaxDVDRips = 2,
     [int]$MaxBluRayRips = 1,
     [int]$MaxCDRips = 1,
@@ -198,9 +205,17 @@ function Get-DiscType {
         return "DVD"
     }
 
-    # Check for audio CD (no filesystem)
-    if ($null -eq $Volume.FileSystem -or $Volume.FileSystem -eq "") {
-        return "AudioCD"
+    # Check for audio CD (no filesystem OR CDDA media type)
+    if ($null -eq $Volume.FileSystem -or $Volume.FileSystem -eq "" -or $Drive.MediaType -like "*CD-ROM*" -and $Volume.Size -lt 900MB) {
+        # Additional check: if it's a small disc with "Audio" or "CD" in the label, it's likely audio
+        if ($VolumeLabel -match "Audio" -or ($null -eq $Volume.FileSystem)) {
+            return "AudioCD"
+        }
+    }
+
+    # Size-based BluRay detection: discs > 8GB are BluRay (DVDs max out at ~9GB for DL)
+    if ($Volume.Size -gt 8GB) {
+        return "BluRay"
     }
 
     return "DVD" # Default
@@ -743,7 +758,12 @@ Write-Log "dBpoweramp path: $dBpowerampPath"
 Write-Log "dd path: $ddPath"
 Write-Log "ImgBurn path: $ImgBurnPath"
 Write-Log "Local rip base: $LocalRipBase"
-Write-Log "Concurrency limits: $MaxDVDRips DVD, $MaxBluRayRips Blu-ray, $MaxCDRips CD, $MaxGameRips Video Game ISO"
+if ($BluRayOnly) {
+    Write-Log "*** BLURAY-ONLY MODE ENABLED - DVDs will be SKIPPED ***" -Level "WARNING"
+    Write-Log "Concurrency limits: $MaxBluRayRips Blu-ray, $MaxCDRips CD, $MaxGameRips Video Game ISO"
+} else {
+    Write-Log "Concurrency limits: $MaxDVDRips DVD, $MaxBluRayRips Blu-ray, $MaxCDRips CD, $MaxGameRips Video Game ISO"
+}
 Write-Log "Rip mode: MOVIES = single file (largest), TV SHOWS = all episodes, VIDEO GAMES = ISO backup"
 Write-Log "Monitoring drives for disc insertion..."
 
@@ -787,6 +807,11 @@ while ($true) {
             Start-AudioRip -DriveLetter $DriveLetter
         } elseif ($DiscType -eq "VideoGame") {
             Start-GameISORip -DriveLetter $DriveLetter -VolumeName $VolumeName
+        } elseif ($DiscType -eq "DVD" -and $BluRayOnly) {
+            # BluRay-only mode: Skip DVD ripping
+            Write-Log "SKIPPED: DVD disc '$VolumeName' in drive $DriveLetter (BluRay-only mode enabled)" -Level "WARNING"
+            Write-Log "  To enable DVD ripping, restart with: -BluRayOnly:`$false" -Level "WARNING"
+            # Don't eject - leave DVD in drive for manual handling
         } else {
             Start-VideoRip -DriveLetter $DriveLetter -DiscType $DiscType -VolumeName $VolumeName
         }

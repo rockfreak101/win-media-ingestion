@@ -1,7 +1,7 @@
 # Media Ingestion System - Fixes and Deployment Summary
 
 **Date**: 2025-12-02
-**System**: win-ingest-01 (192.168.1.80)
+**System**: win-ingest-01 (192.168.2.96)
 **Status**: Ready for Deployment
 
 ---
