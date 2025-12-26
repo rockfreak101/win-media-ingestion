@@ -39,11 +39,21 @@ param(
     [int]$FileSizeCheckWaitSeconds = 5,
 
     # Minimum file size (skip small files like samples)
-    [int]$MinFileSizeMB = 500
+    [int]$MinFileSizeMB = 500,
+
+    # Target encoding bitrate in Mbps - skip files already at or below this
+    [int]$TargetBitrateMbps = 6,
+
+    # Bitrate threshold multiplier - skip if source <= target * multiplier
+    # e.g., 1.3 means skip if source is within 30% of target (already efficient)
+    [double]$BitrateThresholdMultiplier = 1.3
 )
 
 $LogFile = "C:\Scripts\Logs\nfs-video-processing.log"
 $SkippedFilesLog = "C:\Scripts\Logs\nfs-skipped-already-compressed.log"
+
+# Calculate skip threshold: skip files at or below this bitrate (in kbps)
+$SkipBitrateKbps = $TargetBitrateMbps * 1000 * $BitrateThresholdMultiplier
 
 # Codecs that are considered "already compressed" and should be skipped
 $CompressedCodecs = @("hevc", "h265", "av1", "vp9")
@@ -86,24 +96,25 @@ function Write-SkippedFile {
 function Test-AlreadyCompressed {
     <#
     .SYNOPSIS
-    Checks if a video file is already encoded with an efficient codec (H.265/HEVC, AV1, VP9).
+    Checks if a video file is already encoded with an efficient codec or low bitrate.
 
     .DESCRIPTION
-    Uses ffprobe to detect the video codec. Files already compressed with modern codecs
-    would likely increase in size if re-encoded, so they should be skipped.
+    Uses ffprobe to detect the video codec and bitrate. Files already compressed with
+    modern codecs (HEVC, AV1, VP9) or already at low bitrate would likely increase
+    in size if re-encoded, so they should be skipped.
 
     .RETURNS
-    Returns a hashtable with 'IsCompressed' boolean and 'Codec' string, or $null on error.
+    Returns a hashtable with 'IsCompressed', 'IsLowBitrate', 'Codec', 'BitrateKbps', or $null on error.
     #>
     param([string]$FilePath)
 
     try {
-        # Use ffprobe to get video codec
+        # Use ffprobe to get video codec and bitrate
         $ffprobeArgs = @(
             "-v", "error",
             "-select_streams", "v:0",
-            "-show_entries", "stream=codec_name",
-            "-of", "default=noprint_wrappers=1:nokey=1",
+            "-show_entries", "stream=codec_name,bit_rate",
+            "-of", "json",
             "`"$FilePath`""
         ) -join ' '
 
@@ -119,19 +130,67 @@ function Test-AlreadyCompressed {
         $process.StartInfo = $psi
         $process.Start() | Out-Null
 
-        $codec = $process.StandardOutput.ReadToEnd().Trim().ToLower()
+        $output = $process.StandardOutput.ReadToEnd()
         $process.WaitForExit()
 
-        if ($process.ExitCode -ne 0 -or [string]::IsNullOrEmpty($codec)) {
-            Write-Log "Could not detect codec for: $FilePath" -Level "WARNING"
+        if ($process.ExitCode -ne 0 -or [string]::IsNullOrEmpty($output)) {
+            Write-Log "Could not detect codec/bitrate for: $FilePath" -Level "WARNING"
             return $null
         }
 
+        $json = $output | ConvertFrom-Json
+        $stream = $json.streams | Select-Object -First 1
+
+        if (-not $stream) {
+            Write-Log "No video stream found in: $FilePath" -Level "WARNING"
+            return $null
+        }
+
+        $codec = $stream.codec_name.ToLower()
+        $bitrateKbps = 0
+
+        # Try to get bitrate from stream, fall back to calculating from file size/duration
+        if ($stream.bit_rate) {
+            $bitrateKbps = [math]::Round([int64]$stream.bit_rate / 1000, 0)
+        } else {
+            # Bitrate not in stream, try format-level bitrate
+            $ffprobeArgs2 = @(
+                "-v", "error",
+                "-show_entries", "format=bit_rate,duration",
+                "-of", "json",
+                "`"$FilePath`""
+            ) -join ' '
+
+            $psi2 = New-Object System.Diagnostics.ProcessStartInfo
+            $psi2.FileName = $FFprobePath
+            $psi2.Arguments = $ffprobeArgs2
+            $psi2.UseShellExecute = $false
+            $psi2.RedirectStandardOutput = $true
+            $psi2.RedirectStandardError = $true
+            $psi2.CreateNoWindow = $true
+
+            $process2 = New-Object System.Diagnostics.Process
+            $process2.StartInfo = $psi2
+            $process2.Start() | Out-Null
+            $output2 = $process2.StandardOutput.ReadToEnd()
+            $process2.WaitForExit()
+
+            if ($output2) {
+                $json2 = $output2 | ConvertFrom-Json
+                if ($json2.format.bit_rate) {
+                    $bitrateKbps = [math]::Round([int64]$json2.format.bit_rate / 1000, 0)
+                }
+            }
+        }
+
         $isCompressed = $CompressedCodecs -contains $codec
+        $isLowBitrate = ($bitrateKbps -gt 0) -and ($bitrateKbps -le $SkipBitrateKbps)
 
         return @{
             IsCompressed = $isCompressed
+            IsLowBitrate = $isLowBitrate
             Codec = $codec
+            BitrateKbps = $bitrateKbps
         }
     } catch {
         Write-Log "ffprobe error for $FilePath : $($_.Exception.Message)" -Level "ERROR"
@@ -289,10 +348,15 @@ function Invoke-FFmpegEncode {
     }
 
     # Build FFmpeg arguments with proper quoting
+    # Map streams explicitly: first video, all audio, all subtitles (optional)
+    # This prevents errors when source has data/attachment streams
     $Arguments = @(
         "-hide_banner",
         "-y",
         "-i", "`"$InputFile`"",
+        "-map", "0:v:0",
+        "-map", "0:a?",
+        "-map", "0:s?",
         "-c:v", "av1_amf",
         "-quality", "balanced",
         "-rc", "vbr_peak",
@@ -301,7 +365,6 @@ function Invoke-FFmpegEncode {
         "-bufsize", "20M",
         "-usage", "transcoding",
         "-pix_fmt", "yuv420p",
-        "-map", "0",
         "-c:a", "copy",
         "-c:s", "copy",
         "`"$OutputFile`""
@@ -466,10 +529,11 @@ Write-Log "Movies output: $NfsSharePath\$MoviesEncodedFolder"
 Write-Log "TV output: $NfsSharePath\$TVEncodedFolder"
 Write-Log "Local Download: $LocalDownloadPath"
 Write-Log "Local Encoded: $LocalEncodedPath"
-Write-Log "Encoder: FFmpeg AMD AMF AV1 (6 Mbps target, 10 Mbps max)"
+Write-Log "Encoder: FFmpeg AMD AMF AV1 ($TargetBitrateMbps Mbps target, 10 Mbps max)"
 Write-Log "Min file size: $MinFileSizeMB MB"
 Write-Log "Poll interval: $PollIntervalSeconds seconds"
 Write-Log "Skip codecs: $($CompressedCodecs -join ', ') (already compressed)"
+Write-Log "Skip bitrate: <= $([math]::Round($SkipBitrateKbps/1000, 1)) Mbps (already efficient)"
 Write-Log "Skipped files log: $SkippedFilesLog"
 Write-Log ""
 Write-Log "Workflow: Check codec -> Download from NFS -> Encode local -> Upload to NFS -> Cleanup"
@@ -491,10 +555,20 @@ if (-not (Ensure-SmbSession -Path $NfsSharePath -User $NfsUser -Password $NfsPas
 Write-Log "Monitoring NFS for video files..."
 
 while ($true) {
-    # Re-establish SMB session if needed
-    if (-not (Test-Path $NfsSharePath)) {
-        Write-Log "NFS connection lost, reconnecting..." -Level "WARNING"
-        Ensure-SmbSession -Path $NfsSharePath -User $NfsUser -Password $NfsPassword
+    # Re-establish SMB session if needed (wrap in try-catch for access denied errors)
+    try {
+        $nfsAccessible = Test-Path $NfsSharePath -ErrorAction Stop
+    } catch {
+        $nfsAccessible = $false
+    }
+
+    if (-not $nfsAccessible) {
+        Write-Log "NFS connection lost or inaccessible, reconnecting..." -Level "WARNING"
+        if (-not (Ensure-SmbSession -Path $NfsSharePath -User $NfsUser -Password $NfsPassword)) {
+            Write-Log "Failed to reconnect to NFS, waiting before retry..." -Level "ERROR"
+            Start-Sleep -Seconds $PollIntervalSeconds
+            continue
+        }
     }
 
     $VideoFiles = Get-NfsVideoFiles
@@ -512,15 +586,23 @@ while ($true) {
         $mediaType = Get-MediaType -SourcePath $File.FullName
         $fileSizeGB = $File.Length / 1GB
 
-        # Check if file is already compressed with efficient codec
+        # Check if file is already compressed with efficient codec or low bitrate
         $codecCheck = Test-AlreadyCompressed -FilePath $File.FullName
-        if ($codecCheck -and $codecCheck.IsCompressed) {
-            Write-SkippedFile -FilePath $File.FullName -Codec $codecCheck.Codec -SizeGB $fileSizeGB -Reason "Already compressed - would increase in size"
-            continue
+        if ($codecCheck) {
+            if ($codecCheck.IsCompressed) {
+                Write-SkippedFile -FilePath $File.FullName -Codec $codecCheck.Codec -SizeGB $fileSizeGB -Reason "Already compressed ($($codecCheck.Codec)) - would increase in size"
+                continue
+            }
+            if ($codecCheck.IsLowBitrate) {
+                $bitrateMbps = [math]::Round($codecCheck.BitrateKbps / 1000, 1)
+                Write-SkippedFile -FilePath $File.FullName -Codec $codecCheck.Codec -SizeGB $fileSizeGB -Reason "Already low bitrate ($bitrateMbps Mbps <= $([math]::Round($SkipBitrateKbps/1000, 1)) Mbps threshold)"
+                continue
+            }
         }
 
-        # Log the detected codec for files we will process
-        $codecInfo = if ($codecCheck) { " [Source: $($codecCheck.Codec)]" } else { "" }
+        # Log the detected codec and bitrate for files we will process
+        $bitrateInfo = if ($codecCheck -and $codecCheck.BitrateKbps -gt 0) { " @ $([math]::Round($codecCheck.BitrateKbps/1000, 1)) Mbps" } else { "" }
+        $codecInfo = if ($codecCheck) { " [Source: $($codecCheck.Codec)$bitrateInfo]" } else { "" }
 
         Write-Log "========================================" -Level "SUCCESS"
         Write-Log "Processing [$mediaType]: $($File.Name) ($([math]::Round($fileSizeGB, 2)) GB)$codecInfo" -Level "SUCCESS"
