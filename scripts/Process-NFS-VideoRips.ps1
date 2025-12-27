@@ -1,19 +1,25 @@
 # Process-NFS-VideoRips.ps1
 # Watches NFS/SMB shares for video files, downloads to local, encodes, uploads back
+#
+# PARALLEL PROCESSING VERSION:
+#   - Buffered downloads: Pre-downloads next files while encoding
+#   - Parallel encoding: Runs multiple FFmpeg instances simultaneously
+#
 # Workflow:
 #   1. Watch NFS shares (More_Movies, TV) for MKV/M2TS files
 #   2. Check if file is already compressed (H.265/HEVC, AV1, VP9) - skip if so
-#   3. Download file to local F: drive
-#   4. Encode locally with AMD AMF AV1
-#   5. Upload encoded file to appropriate NFS destination (Movies_Encoded or TV_Encoded)
+#   3. Download files to local buffer (pre-download next files)
+#   4. Encode in parallel with AMD AMF AV1 (multiple streams)
+#   5. Upload encoded files to appropriate NFS destination
 #   6. Delete original from NFS and both local copies
 #
 # 2025-12-23: Initial creation - NFS pull/encode/push workflow
-# 2025-12-23: Updated to watch More_Movies and TV folders
-# 2025-12-24: Skip already-compressed files (H.265/HEVC, AV1, VP9) and log them for review
+# 2025-12-26: Added bitrate detection to skip already-efficient files
+# 2025-12-27: Added buffered downloads and parallel encoding
+# 2025-12-27: Improved SMB session handling for better connection reliability
 
 param(
-    # NFS/SMB base path (10Gb network) - this is the SMB share
+    # NFS/SMB share path - use UNC with explicit credential management
     [string]$NfsSharePath = "\\10.0.0.1\media",
     [string]$NfsUser = "jluczani",
     [string]$NfsPassword = "password",
@@ -34,7 +40,7 @@ param(
     [string]$FFprobePath = "C:\ffmpeg\bin\ffprobe.exe",
 
     # Timing
-    [int]$PollIntervalSeconds = 60,
+    [int]$PollIntervalSeconds = 30,
     [int]$FileReadyAgeSeconds = 30,
     [int]$FileSizeCheckWaitSeconds = 5,
 
@@ -45,8 +51,14 @@ param(
     [int]$TargetBitrateMbps = 6,
 
     # Bitrate threshold multiplier - skip if source <= target * multiplier
-    # e.g., 1.3 means skip if source is within 30% of target (already efficient)
-    [double]$BitrateThresholdMultiplier = 1.3
+    [double]$BitrateThresholdMultiplier = 1.3,
+
+    # PARALLEL PROCESSING SETTINGS
+    # Number of files to buffer (pre-download while encoding)
+    [int]$DownloadBufferSize = 3,
+
+    # Number of parallel FFmpeg encoding jobs
+    [int]$ParallelEncodes = 2
 )
 
 $LogFile = "C:\Scripts\Logs\nfs-video-processing.log"
@@ -57,6 +69,13 @@ $SkipBitrateKbps = $TargetBitrateMbps * 1000 * $BitrateThresholdMultiplier
 
 # Codecs that are considered "already compressed" and should be skipped
 $CompressedCodecs = @("hevc", "h265", "av1", "vp9")
+
+# State tracking for parallel processing
+$script:DownloadQueue = [System.Collections.Concurrent.ConcurrentQueue[PSObject]]::new()
+$script:EncodeQueue = [System.Collections.Concurrent.ConcurrentQueue[PSObject]]::new()
+$script:ActiveDownloads = [System.Collections.Concurrent.ConcurrentDictionary[string, object]]::new()
+$script:ActiveEncodes = [System.Collections.Concurrent.ConcurrentDictionary[string, object]]::new()
+$script:ProcessedFiles = [System.Collections.Concurrent.ConcurrentDictionary[string, bool]]::new()
 
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
@@ -69,8 +88,15 @@ function Write-Log {
         New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
     }
 
-    $LogMessage | Add-Content -Path $LogFile
-    Write-Host $LogMessage
+    # Thread-safe logging
+    $mutex = New-Object System.Threading.Mutex($false, "NfsVideoLogMutex")
+    try {
+        $mutex.WaitOne() | Out-Null
+        $LogMessage | Add-Content -Path $LogFile
+        Write-Host $LogMessage
+    } finally {
+        $mutex.ReleaseMutex()
+    }
 }
 
 function Write-SkippedFile {
@@ -83,7 +109,6 @@ function Write-SkippedFile {
     $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $LogEntry = "$Timestamp | $Codec | $([math]::Round($SizeGB, 2)) GB | $Reason | $FilePath"
 
-    # Ensure log directory exists
     $LogDir = Split-Path -Path $SkippedFilesLog -Parent
     if (-not (Test-Path $LogDir)) {
         New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
@@ -94,22 +119,9 @@ function Write-SkippedFile {
 }
 
 function Test-AlreadyCompressed {
-    <#
-    .SYNOPSIS
-    Checks if a video file is already encoded with an efficient codec or low bitrate.
-
-    .DESCRIPTION
-    Uses ffprobe to detect the video codec and bitrate. Files already compressed with
-    modern codecs (HEVC, AV1, VP9) or already at low bitrate would likely increase
-    in size if re-encoded, so they should be skipped.
-
-    .RETURNS
-    Returns a hashtable with 'IsCompressed', 'IsLowBitrate', 'Codec', 'BitrateKbps', or $null on error.
-    #>
     param([string]$FilePath)
 
     try {
-        # Use ffprobe to get video codec and bitrate
         $ffprobeArgs = @(
             "-v", "error",
             "-select_streams", "v:0",
@@ -134,7 +146,6 @@ function Test-AlreadyCompressed {
         $process.WaitForExit()
 
         if ($process.ExitCode -ne 0 -or [string]::IsNullOrEmpty($output)) {
-            Write-Log "Could not detect codec/bitrate for: $FilePath" -Level "WARNING"
             return $null
         }
 
@@ -142,18 +153,15 @@ function Test-AlreadyCompressed {
         $stream = $json.streams | Select-Object -First 1
 
         if (-not $stream) {
-            Write-Log "No video stream found in: $FilePath" -Level "WARNING"
             return $null
         }
 
         $codec = $stream.codec_name.ToLower()
         $bitrateKbps = 0
 
-        # Try to get bitrate from stream, fall back to calculating from file size/duration
         if ($stream.bit_rate) {
             $bitrateKbps = [math]::Round([int64]$stream.bit_rate / 1000, 0)
         } else {
-            # Bitrate not in stream, try format-level bitrate
             $ffprobeArgs2 = @(
                 "-v", "error",
                 "-show_entries", "format=bit_rate,duration",
@@ -193,7 +201,6 @@ function Test-AlreadyCompressed {
             BitrateKbps = $bitrateKbps
         }
     } catch {
-        Write-Log "ffprobe error for $FilePath : $($_.Exception.Message)" -Level "ERROR"
         return $null
     }
 }
@@ -206,20 +213,39 @@ function Ensure-SmbSession {
     )
 
     try {
-        # Test if already connected
-        if (Test-Path $Path) {
+        # First check if already accessible
+        $testResult = $null
+        try {
+            $testResult = Test-Path $Path -ErrorAction Stop
+        } catch {
+            $testResult = $false
+        }
+
+        if ($testResult) {
             return $true
         }
 
-        # Establish connection
-        net use $Path $Password /user:$User /persistent:no 2>$null | Out-Null
+        Write-Log "SMB path $Path not accessible, reconnecting..." -Level "WARNING"
 
-        if (Test-Path $Path) {
-            Write-Log "SMB session established for $Path" -Level "SUCCESS"
-            return $true
+        # Remove any existing session
+        net use $Path /delete /y 2>$null | Out-Null
+        Start-Sleep -Milliseconds 500
+
+        # Create new session with explicit credentials
+        $netResult = net use $Path /user:$User $Password /persistent:no 2>&1
+
+        Start-Sleep -Milliseconds 500
+        try {
+            $connected = Test-Path $Path -ErrorAction Stop
+            if ($connected) {
+                Write-Log "SMB session established for $Path" -Level "SUCCESS"
+                return $true
+            }
+        } catch {
+            Write-Log "SMB test failed after connect: $($_.Exception.Message)" -Level "WARNING"
         }
 
-        Write-Log "Could not access $Path after connection attempt" -Level "ERROR"
+        Write-Log "Could not access $Path - net use result: $netResult" -Level "ERROR"
         return $false
     } catch {
         Write-Log "SMB session failed: $($_.Exception.Message)" -Level "ERROR"
@@ -230,13 +256,11 @@ function Ensure-SmbSession {
 function Test-FileReady {
     param([System.IO.FileInfo]$File)
 
-    # Check file age
     $FileAge = (Get-Date) - $File.LastWriteTime
     if ($FileAge.TotalSeconds -lt $FileReadyAgeSeconds) {
         return $false
     }
 
-    # Try to open file
     try {
         $stream = [System.IO.File]::Open($File.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
         $stream.Close()
@@ -245,7 +269,6 @@ function Test-FileReady {
         return $false
     }
 
-    # Check size stability
     $InitialSize = $File.Length
     Start-Sleep -Seconds $FileSizeCheckWaitSeconds
     $File.Refresh()
@@ -260,7 +283,6 @@ function Test-FileReady {
 function Get-MediaType {
     param([string]$SourcePath)
 
-    # Determine if this is a movie or TV based on source folder
     if ($SourcePath -like "*\TV\*" -or $SourcePath -like "*\TV") {
         return "TV"
     } else {
@@ -275,7 +297,6 @@ function Get-NfsVideoFiles {
         $watchPath = Join-Path $NfsSharePath $folder
 
         if (-not (Test-Path $watchPath)) {
-            Write-Log "Watch path not accessible: $watchPath" -Level "WARNING"
             continue
         }
 
@@ -290,89 +311,95 @@ function Get-NfsVideoFiles {
     return $allFiles
 }
 
-function Copy-FromNfs {
-    param(
-        [System.IO.FileInfo]$SourceFile
-    )
+function Get-LocalDownloadPath {
+    param([System.IO.FileInfo]$SourceFile)
 
-    # Determine media type for folder structure
     $mediaType = Get-MediaType -SourcePath $SourceFile.FullName
-
-    # Create local path preserving some structure
     $fileName = $SourceFile.Name
     $parentFolder = $SourceFile.Directory.Name
 
-    # If parent folder is just "More_Movies" or "TV", use file name directly
-    # Otherwise preserve the show/movie folder
     if ($parentFolder -in $WatchFolders) {
-        $LocalFile = Join-Path $LocalDownloadPath (Join-Path $mediaType $fileName)
+        return Join-Path $LocalDownloadPath (Join-Path $mediaType $fileName)
     } else {
-        $LocalFile = Join-Path $LocalDownloadPath (Join-Path $mediaType (Join-Path $parentFolder $fileName))
-    }
-
-    $LocalDir = Split-Path -Path $LocalFile -Parent
-
-    # Create local directory
-    if (-not (Test-Path $LocalDir)) {
-        New-Item -ItemType Directory -Path $LocalDir -Force | Out-Null
-    }
-
-    Write-Log "Downloading from NFS: $($SourceFile.Name) ($([math]::Round($SourceFile.Length/1GB, 2)) GB)"
-
-    try {
-        $startTime = Get-Date
-        Copy-Item -Path $SourceFile.FullName -Destination $LocalFile -Force
-        $duration = (Get-Date) - $startTime
-        $speedMBps = [math]::Round(($SourceFile.Length / 1MB) / $duration.TotalSeconds, 1)
-
-        Write-Log "Download complete: $speedMBps MB/s" -Level "SUCCESS"
-        return $LocalFile
-    } catch {
-        Write-Log "Download failed: $($_.Exception.Message)" -Level "ERROR"
-        return $null
+        return Join-Path $LocalDownloadPath (Join-Path $mediaType (Join-Path $parentFolder $fileName))
     }
 }
 
-function Invoke-FFmpegEncode {
-    param(
-        [string]$InputFile,
-        [string]$OutputFile
-    )
+function Start-BackgroundDownload {
+    param([System.IO.FileInfo]$SourceFile)
 
-    Write-Log "Encoding with AMD AMF AV1: $(Split-Path $InputFile -Leaf)"
+    $localPath = Get-LocalDownloadPath -SourceFile $SourceFile
+    $localDir = Split-Path -Path $localPath -Parent
 
-    # Ensure output directory exists
-    $OutputDir = Split-Path -Path $OutputFile -Parent
-    if (-not (Test-Path $OutputDir)) {
-        New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+    # Create directory if needed
+    if (-not (Test-Path $localDir)) {
+        New-Item -ItemType Directory -Path $localDir -Force | Out-Null
     }
 
-    # Build FFmpeg arguments with proper quoting
-    # Map streams explicitly: first video, all audio, all subtitles (optional)
-    # This prevents errors when source has data/attachment streams
-    $Arguments = @(
-        "-hide_banner",
-        "-y",
-        "-i", "`"$InputFile`"",
-        "-map", "0:v:0",
-        "-map", "0:a?",
-        "-map", "0:s?",
-        "-c:v", "av1_amf",
-        "-quality", "balanced",
-        "-rc", "vbr_peak",
-        "-b:v", "6M",
-        "-maxrate", "10M",
-        "-bufsize", "20M",
-        "-usage", "transcoding",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "copy",
-        "-c:s", "copy",
-        "`"$OutputFile`""
-    ) -join ' '
+    # Start download as background job
+    $job = Start-Job -ScriptBlock {
+        param($source, $dest)
+        $startTime = Get-Date
+        Copy-Item -Path $source -Destination $dest -Force
+        $duration = (Get-Date) - $startTime
+        $size = (Get-Item $dest).Length
+        $speedMBps = [math]::Round(($size / 1MB) / $duration.TotalSeconds, 1)
+        return @{
+            Success = $true
+            LocalPath = $dest
+            SpeedMBps = $speedMBps
+            SizeGB = [math]::Round($size / 1GB, 2)
+        }
+    } -ArgumentList $SourceFile.FullName, $localPath
 
-    try {
+    return @{
+        Job = $job
+        SourceFile = $SourceFile
+        LocalPath = $localPath
+        StartTime = Get-Date
+    }
+}
+
+function Start-BackgroundEncode {
+    param(
+        [string]$InputFile,
+        [string]$OutputFile,
+        [string]$OriginalNfsPath
+    )
+
+    # Ensure output directory exists
+    $outputDir = Split-Path -Path $OutputFile -Parent
+    if (-not (Test-Path $outputDir)) {
+        New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+    }
+
+    $ffmpegPath = $FFmpegPath
+
+    $job = Start-Job -ScriptBlock {
+        param($ffmpeg, $input, $output)
+
+        $Arguments = @(
+            "-hide_banner",
+            "-y",
+            "-i", "`"$input`"",
+            "-map", "0:v:0",
+            "-map", "0:a?",
+            "-map", "0:s?",
+            "-c:v", "av1_amf",
+            "-quality", "balanced",
+            "-rc", "vbr_peak",
+            "-b:v", "6M",
+            "-maxrate", "10M",
+            "-bufsize", "20M",
+            "-usage", "transcoding",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "copy",
+            "-c:s", "copy",
+            "`"$output`""
+        ) -join ' '
+
         $psi = New-Object System.Diagnostics.ProcessStartInfo
-        $psi.FileName = $FFmpegPath
+        $psi.FileName = $ffmpeg
         $psi.Arguments = $Arguments
         $psi.UseShellExecute = $false
         $psi.RedirectStandardError = $true
@@ -384,46 +411,44 @@ function Invoke-FFmpegEncode {
         $startTime = Get-Date
         $process.Start() | Out-Null
 
-        # Set High priority
         try {
             $process.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::High
-            Write-Log "FFmpeg started with High priority (PID: $($process.Id))"
-        } catch {
-            Write-Log "Could not set High priority" -Level "WARNING"
-        }
+        } catch { }
 
         $stderr = $process.StandardError.ReadToEnd()
         $process.WaitForExit()
         $duration = (Get-Date) - $startTime
 
-        if ($process.ExitCode -eq 0) {
-            $InputSize = (Get-Item $InputFile).Length / 1GB
-            $OutputSize = (Get-Item $OutputFile).Length / 1GB
-            $Reduction = [math]::Round((($InputSize - $OutputSize) / $InputSize) * 100, 1)
+        $inputSize = (Get-Item $input).Length / 1GB
+        $outputSize = if (Test-Path $output) { (Get-Item $output).Length / 1GB } else { 0 }
 
-            Write-Log "Encoding complete in $([math]::Round($duration.TotalMinutes, 1)) min" -Level "SUCCESS"
-            Write-Log "Size: $([math]::Round($InputSize, 2))GB -> $([math]::Round($OutputSize, 2))GB ($Reduction% reduction)" -Level "SUCCESS"
-            return $true
-        } else {
-            Write-Log "Encoding failed with exit code: $($process.ExitCode)" -Level "ERROR"
-            # Log last few lines of stderr for debugging
-            $lastLines = ($stderr -split "`n" | Select-Object -Last 5) -join "; "
-            Write-Log "FFmpeg error: $lastLines" -Level "ERROR"
-            return $false
+        return @{
+            Success = ($process.ExitCode -eq 0)
+            ExitCode = $process.ExitCode
+            DurationMin = [math]::Round($duration.TotalMinutes, 1)
+            InputSizeGB = [math]::Round($inputSize, 2)
+            OutputSizeGB = [math]::Round($outputSize, 2)
+            Reduction = if ($inputSize -gt 0) { [math]::Round((($inputSize - $outputSize) / $inputSize) * 100, 1) } else { 0 }
+            Stderr = $stderr
+            OutputFile = $output
         }
-    } catch {
-        Write-Log "Encoding exception: $($_.Exception.Message)" -Level "ERROR"
-        return $false
+    } -ArgumentList $ffmpegPath, $InputFile, $OutputFile
+
+    return @{
+        Job = $job
+        InputFile = $InputFile
+        OutputFile = $OutputFile
+        OriginalNfsPath = $OriginalNfsPath
+        StartTime = Get-Date
     }
 }
 
-function Copy-ToNfs {
+function Complete-Upload {
     param(
-        [string]$LocalFile,
+        [string]$LocalEncodedFile,
         [string]$OriginalNfsFile
     )
 
-    # Determine media type and destination
     $mediaType = Get-MediaType -SourcePath $OriginalNfsFile
 
     if ($mediaType -eq "TV") {
@@ -432,11 +457,9 @@ function Copy-ToNfs {
         $destBase = Join-Path $NfsSharePath $MoviesEncodedFolder
     }
 
-    # Get just the filename and parent folder for destination
-    $fileName = Split-Path $LocalFile -Leaf
-    $parentFolder = Split-Path (Split-Path $LocalFile -Parent) -Leaf
+    $fileName = Split-Path $LocalEncodedFile -Leaf
+    $parentFolder = Split-Path (Split-Path $LocalEncodedFile -Parent) -Leaf
 
-    # If parent is just "Movies" or "TV", use file directly
     if ($parentFolder -in @("Movies", "TV")) {
         $NfsDestFile = Join-Path $destBase $fileName
     } else {
@@ -445,7 +468,6 @@ function Copy-ToNfs {
 
     $NfsDestDir = Split-Path -Path $NfsDestFile -Parent
 
-    # Create destination directory
     if (-not (Test-Path $NfsDestDir)) {
         New-Item -ItemType Directory -Path $NfsDestDir -Force | Out-Null
         Write-Log "Created NFS directory: $NfsDestDir"
@@ -454,9 +476,9 @@ function Copy-ToNfs {
     Write-Log "Uploading to NFS ($mediaType): $NfsDestFile"
 
     try {
-        $FileSize = (Get-Item $LocalFile).Length
+        $FileSize = (Get-Item $LocalEncodedFile).Length
         $startTime = Get-Date
-        Copy-Item -Path $LocalFile -Destination $NfsDestFile -Force
+        Copy-Item -Path $LocalEncodedFile -Destination $NfsDestFile -Force
         $duration = (Get-Date) - $startTime
         $speedMBps = [math]::Round(($FileSize / 1MB) / $duration.TotalSeconds, 1)
 
@@ -475,40 +497,33 @@ function Remove-ProcessedFiles {
         [string]$LocalEncoded
     )
 
-    # Delete NFS original
     try {
-        Remove-Item -Path $NfsOriginal -Force
+        Remove-Item -Path $NfsOriginal -Force -ErrorAction Stop
         Write-Log "Deleted NFS original: $NfsOriginal" -Level "SUCCESS"
     } catch {
         Write-Log "Could not delete NFS original: $($_.Exception.Message)" -Level "WARNING"
     }
 
-    # Delete local download
     try {
         if (Test-Path $LocalDownload) {
             Remove-Item -Path $LocalDownload -Force
             Write-Log "Deleted local download: $LocalDownload"
         }
-    } catch {
-        Write-Log "Could not delete local download: $($_.Exception.Message)" -Level "WARNING"
-    }
+    } catch { }
 
-    # Delete local encoded
     try {
         if (Test-Path $LocalEncoded) {
             Remove-Item -Path $LocalEncoded -Force
             Write-Log "Deleted local encoded: $LocalEncoded"
         }
-    } catch {
-        Write-Log "Could not delete local encoded: $($_.Exception.Message)" -Level "WARNING"
-    }
+    } catch { }
 
     # Cleanup empty directories
     foreach ($path in @($LocalDownload, $LocalEncoded)) {
         if ($path) {
             $parentDir = Split-Path -Path $path -Parent
             try {
-                if ((Test-Path $parentDir) -and ((Get-ChildItem -Path $parentDir -Force).Count -eq 0)) {
+                if ((Test-Path $parentDir) -and ((Get-ChildItem -Path $parentDir -Force -ErrorAction SilentlyContinue).Count -eq 0)) {
                     Remove-Item -Path $parentDir -Force -Recurse -ErrorAction SilentlyContinue
                 }
             } catch { }
@@ -517,11 +532,12 @@ function Remove-ProcessedFiles {
 }
 
 # ============================================================================
-# MAIN LOOP
+# MAIN LOOP - PARALLEL PROCESSING
 # ============================================================================
 
 Write-Log "============================================" -Level "SUCCESS"
 Write-Log "NFS Video Processing Monitor Started" -Level "SUCCESS"
+Write-Log "PARALLEL MODE: $ParallelEncodes concurrent encodes, $DownloadBufferSize file buffer" -Level "SUCCESS"
 Write-Log "============================================" -Level "SUCCESS"
 Write-Log "NFS Base: $NfsSharePath"
 Write-Log "Watch folders: $($WatchFolders -join ', ')"
@@ -534,9 +550,8 @@ Write-Log "Min file size: $MinFileSizeMB MB"
 Write-Log "Poll interval: $PollIntervalSeconds seconds"
 Write-Log "Skip codecs: $($CompressedCodecs -join ', ') (already compressed)"
 Write-Log "Skip bitrate: <= $([math]::Round($SkipBitrateKbps/1000, 1)) Mbps (already efficient)"
-Write-Log "Skipped files log: $SkippedFilesLog"
 Write-Log ""
-Write-Log "Workflow: Check codec -> Download from NFS -> Encode local -> Upload to NFS -> Cleanup"
+Write-Log "Workflow: Buffer downloads -> Parallel encode -> Upload -> Cleanup"
 
 # Ensure local directories exist
 foreach ($dir in @($LocalDownloadPath, $LocalEncodedPath)) {
@@ -554,8 +569,13 @@ if (-not (Ensure-SmbSession -Path $NfsSharePath -User $NfsUser -Password $NfsPas
 
 Write-Log "Monitoring NFS for video files..."
 
+# Track active jobs
+$activeDownloads = @{}
+$activeEncodes = @{}
+$downloadedQueue = [System.Collections.Queue]::new()
+
 while ($true) {
-    # Re-establish SMB session if needed (wrap in try-catch for access denied errors)
+    # Re-establish SMB session if needed
     try {
         $nfsAccessible = Test-Path $NfsSharePath -ErrorAction Stop
     } catch {
@@ -563,84 +583,170 @@ while ($true) {
     }
 
     if (-not $nfsAccessible) {
-        Write-Log "NFS connection lost or inaccessible, reconnecting..." -Level "WARNING"
+        Write-Log "NFS path not accessible, reconnecting..." -Level "WARNING"
         if (-not (Ensure-SmbSession -Path $NfsSharePath -User $NfsUser -Password $NfsPassword)) {
-            Write-Log "Failed to reconnect to NFS, waiting before retry..." -Level "ERROR"
             Start-Sleep -Seconds $PollIntervalSeconds
             continue
         }
     }
 
-    $VideoFiles = Get-NfsVideoFiles
+    # Get all video files
+    $allVideoFiles = Get-NfsVideoFiles
 
-    if ($VideoFiles.Count -gt 0) {
-        Write-Log "Found $($VideoFiles.Count) video file(s) on NFS to process"
+    # Filter to files not already processed or in progress
+    $availableFiles = $allVideoFiles | Where-Object {
+        $filePath = $_.FullName
+        -not $script:ProcessedFiles.ContainsKey($filePath) -and
+        -not $activeDownloads.ContainsKey($filePath) -and
+        -not ($downloadedQueue.ToArray() | Where-Object { $_.OriginalNfsPath -eq $filePath }) -and
+        -not $activeEncodes.ContainsKey($filePath)
     }
 
-    foreach ($File in $VideoFiles) {
-        # Check if file is ready
-        if (-not (Test-FileReady -File $File)) {
-            continue
+    # =========================================================================
+    # STEP 1: Check completed downloads
+    # =========================================================================
+    $completedDownloads = @()
+    foreach ($key in @($activeDownloads.Keys)) {
+        $dl = $activeDownloads[$key]
+        if ($dl.Job.State -eq 'Completed') {
+            $result = Receive-Job -Job $dl.Job
+            Remove-Job -Job $dl.Job -Force
+
+            if ($result.Success) {
+                Write-Log "Download complete: $($dl.SourceFile.Name) ($($result.SizeGB) GB @ $($result.SpeedMBps) MB/s)" -Level "SUCCESS"
+                $downloadedQueue.Enqueue(@{
+                    LocalPath = $result.LocalPath
+                    OriginalNfsPath = $dl.SourceFile.FullName
+                    SourceFile = $dl.SourceFile
+                })
+            } else {
+                Write-Log "Download failed: $($dl.SourceFile.Name)" -Level "ERROR"
+                $script:ProcessedFiles[$dl.SourceFile.FullName] = $true  # Mark as processed to skip
+            }
+            $completedDownloads += $key
+        } elseif ($dl.Job.State -eq 'Failed') {
+            Write-Log "Download job failed: $($dl.SourceFile.Name)" -Level "ERROR"
+            Remove-Job -Job $dl.Job -Force
+            $script:ProcessedFiles[$dl.SourceFile.FullName] = $true
+            $completedDownloads += $key
         }
+    }
+    foreach ($key in $completedDownloads) {
+        $activeDownloads.Remove($key)
+    }
 
-        $mediaType = Get-MediaType -SourcePath $File.FullName
-        $fileSizeGB = $File.Length / 1GB
+    # =========================================================================
+    # STEP 2: Check completed encodes
+    # =========================================================================
+    $completedEncodes = @()
+    foreach ($key in @($activeEncodes.Keys)) {
+        $enc = $activeEncodes[$key]
+        if ($enc.Job.State -eq 'Completed') {
+            $result = Receive-Job -Job $enc.Job
+            Remove-Job -Job $enc.Job -Force
 
-        # Check if file is already compressed with efficient codec or low bitrate
-        $codecCheck = Test-AlreadyCompressed -FilePath $File.FullName
-        if ($codecCheck) {
-            if ($codecCheck.IsCompressed) {
-                Write-SkippedFile -FilePath $File.FullName -Codec $codecCheck.Codec -SizeGB $fileSizeGB -Reason "Already compressed ($($codecCheck.Codec)) - would increase in size"
+            $fileName = Split-Path $enc.InputFile -Leaf
+
+            if ($result.Success) {
+                Write-Log "Encoding complete: $fileName in $($result.DurationMin) min" -Level "SUCCESS"
+                Write-Log "Size: $($result.InputSizeGB)GB -> $($result.OutputSizeGB)GB ($($result.Reduction)% reduction)" -Level "SUCCESS"
+
+                # Upload to NFS
+                $nfsResult = Complete-Upload -LocalEncodedFile $result.OutputFile -OriginalNfsFile $enc.OriginalNfsPath
+
+                if ($nfsResult) {
+                    # Cleanup all files
+                    Remove-ProcessedFiles -NfsOriginal $enc.OriginalNfsPath -LocalDownload $enc.InputFile -LocalEncoded $result.OutputFile
+                    Write-Log "Processing complete: $fileName" -Level "SUCCESS"
+                } else {
+                    Write-Log "Upload failed, keeping files: $fileName" -Level "ERROR"
+                }
+            } else {
+                Write-Log "Encoding failed: $fileName (exit code: $($result.ExitCode))" -Level "ERROR"
+                # Cleanup local download only
+                Remove-Item -Path $enc.InputFile -Force -ErrorAction SilentlyContinue
+            }
+
+            $script:ProcessedFiles[$enc.OriginalNfsPath] = $true
+            $completedEncodes += $key
+        } elseif ($enc.Job.State -eq 'Failed') {
+            Write-Log "Encode job failed: $(Split-Path $enc.InputFile -Leaf)" -Level "ERROR"
+            Remove-Job -Job $enc.Job -Force
+            Remove-Item -Path $enc.InputFile -Force -ErrorAction SilentlyContinue
+            $script:ProcessedFiles[$enc.OriginalNfsPath] = $true
+            $completedEncodes += $key
+        }
+    }
+    foreach ($key in $completedEncodes) {
+        $activeEncodes.Remove($key)
+    }
+
+    # =========================================================================
+    # STEP 3: Start new encodes from downloaded queue
+    # =========================================================================
+    while ($activeEncodes.Count -lt $ParallelEncodes -and $downloadedQueue.Count -gt 0) {
+        $item = $downloadedQueue.Dequeue()
+
+        # Determine output path
+        $relativePath = $item.LocalPath.Substring($LocalDownloadPath.Length).TrimStart('\')
+        $localEncodedFile = Join-Path $LocalEncodedPath $relativePath
+
+        $fileName = Split-Path $item.LocalPath -Leaf
+        Write-Log "Starting encode [$($activeEncodes.Count + 1)/$ParallelEncodes]: $fileName" -Level "INFO"
+
+        $encodeJob = Start-BackgroundEncode -InputFile $item.LocalPath -OutputFile $localEncodedFile -OriginalNfsPath $item.OriginalNfsPath
+        $activeEncodes[$item.OriginalNfsPath] = $encodeJob
+    }
+
+    # =========================================================================
+    # STEP 4: Start new downloads to fill buffer
+    # =========================================================================
+    $totalBuffered = $activeDownloads.Count + $downloadedQueue.Count
+    $neededDownloads = $DownloadBufferSize - $totalBuffered
+
+    if ($neededDownloads -gt 0 -and $availableFiles.Count -gt 0) {
+        $filesToDownload = $availableFiles | Select-Object -First $neededDownloads
+
+        foreach ($file in $filesToDownload) {
+            # Check if file is ready and should be encoded
+            if (-not (Test-FileReady -File $file)) {
                 continue
             }
-            if ($codecCheck.IsLowBitrate) {
-                $bitrateMbps = [math]::Round($codecCheck.BitrateKbps / 1000, 1)
-                Write-SkippedFile -FilePath $File.FullName -Codec $codecCheck.Codec -SizeGB $fileSizeGB -Reason "Already low bitrate ($bitrateMbps Mbps <= $([math]::Round($SkipBitrateKbps/1000, 1)) Mbps threshold)"
-                continue
+
+            $fileSizeGB = $file.Length / 1GB
+
+            # Check codec/bitrate
+            $codecCheck = Test-AlreadyCompressed -FilePath $file.FullName
+            if ($codecCheck) {
+                if ($codecCheck.IsCompressed) {
+                    Write-SkippedFile -FilePath $file.FullName -Codec $codecCheck.Codec -SizeGB $fileSizeGB -Reason "Already compressed"
+                    $script:ProcessedFiles[$file.FullName] = $true
+                    continue
+                }
+                if ($codecCheck.IsLowBitrate) {
+                    $bitrateMbps = [math]::Round($codecCheck.BitrateKbps / 1000, 1)
+                    Write-SkippedFile -FilePath $file.FullName -Codec $codecCheck.Codec -SizeGB $fileSizeGB -Reason "Low bitrate ($bitrateMbps Mbps)"
+                    $script:ProcessedFiles[$file.FullName] = $true
+                    continue
+                }
             }
+
+            $bitrateInfo = if ($codecCheck -and $codecCheck.BitrateKbps -gt 0) { " @ $([math]::Round($codecCheck.BitrateKbps/1000, 1)) Mbps" } else { "" }
+            $mediaType = Get-MediaType -SourcePath $file.FullName
+
+            Write-Log "Queuing download [$mediaType]: $($file.Name) ($([math]::Round($fileSizeGB, 2)) GB)$bitrateInfo" -Level "INFO"
+
+            $downloadJob = Start-BackgroundDownload -SourceFile $file
+            $activeDownloads[$file.FullName] = $downloadJob
         }
+    }
 
-        # Log the detected codec and bitrate for files we will process
-        $bitrateInfo = if ($codecCheck -and $codecCheck.BitrateKbps -gt 0) { " @ $([math]::Round($codecCheck.BitrateKbps/1000, 1)) Mbps" } else { "" }
-        $codecInfo = if ($codecCheck) { " [Source: $($codecCheck.Codec)$bitrateInfo]" } else { "" }
-
-        Write-Log "========================================" -Level "SUCCESS"
-        Write-Log "Processing [$mediaType]: $($File.Name) ($([math]::Round($fileSizeGB, 2)) GB)$codecInfo" -Level "SUCCESS"
-        Write-Log "Source: $($File.DirectoryName)" -Level "INFO"
-        Write-Log "========================================" -Level "SUCCESS"
-
-        # Step 1: Download from NFS to local
-        $LocalDownloadFile = Copy-FromNfs -SourceFile $File
-        if (-not $LocalDownloadFile) {
-            Write-Log "Failed to download, skipping file" -Level "ERROR"
-            continue
-        }
-
-        # Step 2: Determine local encoded path (mirror download structure)
-        $RelativePath = $LocalDownloadFile.Substring($LocalDownloadPath.Length).TrimStart('\')
-        $LocalEncodedFile = Join-Path $LocalEncodedPath $RelativePath
-
-        # Step 3: Encode locally
-        $EncodeSuccess = Invoke-FFmpegEncode -InputFile $LocalDownloadFile -OutputFile $LocalEncodedFile
-        if (-not $EncodeSuccess) {
-            Write-Log "Encoding failed, keeping original on NFS" -Level "ERROR"
-            # Clean up local download only
-            Remove-Item -Path $LocalDownloadFile -Force -ErrorAction SilentlyContinue
-            continue
-        }
-
-        # Step 4: Upload to NFS (routed to correct folder based on media type)
-        $NfsEncodedFile = Copy-ToNfs -LocalFile $LocalEncodedFile -OriginalNfsFile $File.FullName
-        if (-not $NfsEncodedFile) {
-            Write-Log "Upload failed, keeping local encoded file: $LocalEncodedFile" -Level "ERROR"
-            Remove-Item -Path $LocalDownloadFile -Force -ErrorAction SilentlyContinue
-            continue
-        }
-
-        # Step 5: Cleanup - delete original from NFS and both local copies
-        Remove-ProcessedFiles -NfsOriginal $File.FullName -LocalDownload $LocalDownloadFile -LocalEncoded $LocalEncodedFile
-
-        Write-Log "Processing complete for: $($File.Name)" -Level "SUCCESS"
+    # =========================================================================
+    # STEP 5: Status update
+    # =========================================================================
+    if ($activeDownloads.Count -gt 0 -or $activeEncodes.Count -gt 0 -or $downloadedQueue.Count -gt 0) {
+        $status = "Active: $($activeEncodes.Count) encoding, $($activeDownloads.Count) downloading, $($downloadedQueue.Count) queued"
+        # Only log status every few cycles to reduce noise
     }
 
     Start-Sleep -Seconds $PollIntervalSeconds
