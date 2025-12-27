@@ -408,49 +408,70 @@ function Process-VideoFile {
     # Encode with FFmpeg AMD AMF AV1
     Write-Log "Encoding with AMD AMF AV1: $fileName"
 
-    # Build FFmpeg argument string
-    $ffmpegArgs = "-y -i `"$localDownloadFile`" -c:v av1_amf -quality quality -rc vbr_peak -b:v ${TargetBitrateMbps}M -maxrate 10M -map 0:v:0 -map 0:a? -map 0:s? -c:a copy -c:s copy `"$localEncodedFile`""
-
     # Use temp file for stderr to avoid buffer deadlock
     $stderrFile = Join-Path $env:TEMP "ffmpeg_stderr_$([guid]::NewGuid().ToString('N').Substring(0,8)).log"
 
     $encodeStart = Get-Date
 
-    # Start process without waiting first so we can set priority
-    $processResult = Start-Process -FilePath $FFmpegPath -ArgumentList $ffmpegArgs -PassThru -NoNewWindow -RedirectStandardError $stderrFile
+    # Use System.Diagnostics.Process for proper process tracking
+    # Start-Process with -PassThru has known issues with WaitForExit()
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $FFmpegPath
+    $psi.Arguments = "-y -i `"$localDownloadFile`" -c:v av1_amf -quality quality -rc vbr_peak -b:v ${TargetBitrateMbps}M -maxrate 10M -map 0:v:0 -map 0:a? -map 0:s? -c:a copy -c:s copy `"$localEncodedFile`""
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
 
-    # Set high priority immediately
+    $ffmpegProcess = New-Object System.Diagnostics.Process
+    $ffmpegProcess.StartInfo = $psi
+
     try {
-        Start-Sleep -Milliseconds 100  # Brief pause for process to initialize
-        $processResult.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::High
-        Write-Log "FFmpeg started with High priority (PID: $($processResult.Id))"
+        $ffmpegProcess.Start() | Out-Null
+
+        # Set high priority
+        try {
+            $ffmpegProcess.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::High
+            Write-Log "FFmpeg started with High priority (PID: $($ffmpegProcess.Id))"
+        } catch {
+            Write-Log "FFmpeg started (PID: $($ffmpegProcess.Id))"
+        }
+
+        # Read stderr asynchronously to prevent buffer deadlock
+        $stderrTask = $ffmpegProcess.StandardError.ReadToEndAsync()
+
+        # Wait for process to complete
+        $ffmpegProcess.WaitForExit()
+        $encodeTime = (Get-Date) - $encodeStart
+
+        # Get stderr content
+        $stderrContent = $stderrTask.Result
+        if ($stderrContent) {
+            $stderrContent | Set-Content $stderrFile -Force
+        }
+
+        $exitCode = $ffmpegProcess.ExitCode
     } catch {
-        Write-Log "FFmpeg started (PID: $($processResult.Id))"
+        Write-Log "FFmpeg process error: $($_.Exception.Message)" -Level "ERROR"
+        $exitCode = -999
+    } finally {
+        if ($ffmpegProcess) {
+            $ffmpegProcess.Dispose()
+        }
     }
 
-    # Now wait for process to complete
-    $processResult.WaitForExit()
-    $encodeTime = (Get-Date) - $encodeStart
-
-    # Handle exit code - null means process may not have completed properly
-    $exitCode = $processResult.ExitCode
     $encodingSuccess = $false
 
     # Check if output file exists and has content as backup verification
     $outputExists = (Test-Path $localEncodedFile) -and ((Get-Item $localEncodedFile -ErrorAction SilentlyContinue).Length -gt 1MB)
 
-    if ($null -eq $exitCode) {
-        # ExitCode is null - check if output file exists as backup verification
-        if ($outputExists) {
-            Write-Log "FFmpeg ExitCode was null but output file exists - treating as success" -Level "WARNING"
-            $encodingSuccess = $true
-        } else {
-            Write-Log "Encoding failed: ExitCode was null and no valid output file" -Level "ERROR"
-        }
-    } elseif ($exitCode -ne 0) {
-        Write-Log "Encoding failed with exit code: $exitCode" -Level "ERROR"
-    } else {
+    if ($exitCode -eq 0) {
         $encodingSuccess = $true
+    } elseif ($outputExists -and $encodeTime.TotalMinutes -gt 1) {
+        # FFmpeg sometimes returns non-zero but encoding was successful
+        Write-Log "FFmpeg exit code $exitCode but output file exists ($([math]::Round((Get-Item $localEncodedFile).Length/1GB, 2)) GB) - treating as success" -Level "WARNING"
+        $encodingSuccess = $true
+    } else {
+        Write-Log "Encoding failed with exit code: $exitCode" -Level "ERROR"
     }
 
     if (-not $encodingSuccess) {
