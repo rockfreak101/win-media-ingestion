@@ -323,56 +323,44 @@ function Process-VideoFile {
     # Encode with FFmpeg AMD AMF AV1
     Write-Log "Encoding with AMD AMF AV1: $fileName"
 
-    $ffmpegArgs = @(
-        "-y",
-        "-i", "`"$localDownloadFile`"",
-        "-c:v", "av1_amf",
-        "-quality", "quality",
-        "-rc", "vbr_peak",
-        "-b:v", "${TargetBitrateMbps}M",
-        "-maxrate", "10M",
-        "-map", "0:v:0",
-        "-map", "0:a?",
-        "-map", "0:s?",
-        "-c:a", "copy",
-        "-c:s", "copy",
-        "`"$localEncodedFile`""
-    ) -join ' '
+    # Build FFmpeg argument string
+    $ffmpegArgs = "-y -i `"$localDownloadFile`" -c:v av1_amf -quality quality -rc vbr_peak -b:v ${TargetBitrateMbps}M -maxrate 10M -map 0:v:0 -map 0:a? -map 0:s? -c:a copy -c:s copy `"$localEncodedFile`""
 
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $FFmpegPath
-    $psi.Arguments = $ffmpegArgs
-    $psi.UseShellExecute = $false
-    $psi.RedirectStandardOutput = $false
-    $psi.RedirectStandardError = $true
-    $psi.CreateNoWindow = $true
+    # Use temp file for stderr to avoid buffer deadlock
+    $stderrFile = Join-Path $env:TEMP "ffmpeg_stderr_$([guid]::NewGuid().ToString('N').Substring(0,8)).log"
 
     $encodeStart = Get-Date
-    $process = New-Object System.Diagnostics.Process
-    $process.StartInfo = $psi
-    $process.Start() | Out-Null
 
-    # Set high priority
+    # Start process without waiting first so we can set priority
+    $processResult = Start-Process -FilePath $FFmpegPath -ArgumentList $ffmpegArgs -PassThru -NoNewWindow -RedirectStandardError $stderrFile
+
+    # Set high priority immediately
     try {
-        $process.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::High
-        Write-Log "FFmpeg started with High priority (PID: $($process.Id))"
+        Start-Sleep -Milliseconds 100  # Brief pause for process to initialize
+        $processResult.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::High
+        Write-Log "FFmpeg started with High priority (PID: $($processResult.Id))"
     } catch {
-        Write-Log "Could not set FFmpeg priority: $($_.Exception.Message)" -Level "WARNING"
+        Write-Log "FFmpeg started (PID: $($processResult.Id))"
     }
 
-    $process.WaitForExit()
+    # Now wait for process to complete
+    $processResult.WaitForExit()
     $encodeTime = (Get-Date) - $encodeStart
 
-    if ($process.ExitCode -ne 0) {
-        $stderr = $process.StandardError.ReadToEnd()
-        Write-Log "Encoding failed with exit code: $($process.ExitCode)" -Level "ERROR"
+    if ($processResult.ExitCode -ne 0) {
+        $stderr = if (Test-Path $stderrFile) { Get-Content $stderrFile -Tail 20 -Raw } else { "No stderr captured" }
+        Write-Log "Encoding failed with exit code: $($processResult.ExitCode)" -Level "ERROR"
         Write-Log "FFmpeg error: $stderr" -Level "ERROR"
 
-        # Cleanup failed encode
+        # Cleanup
+        Remove-Item -Path $stderrFile -Force -ErrorAction SilentlyContinue
         Remove-Item -Path $localDownloadFile -Force -ErrorAction SilentlyContinue
         Remove-Item -Path $localEncodedFile -Force -ErrorAction SilentlyContinue
         return $false
     }
+
+    # Cleanup stderr temp file
+    Remove-Item -Path $stderrFile -Force -ErrorAction SilentlyContinue
 
     $encodeMinutes = [math]::Round($encodeTime.TotalMinutes, 1)
     Write-Log "Encoding complete in $encodeMinutes min" -Level "SUCCESS"
