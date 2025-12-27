@@ -90,7 +90,13 @@ function Update-Progress {
     try {
         $progress = @{}
         if (Test-Path $ProgressFile) {
-            $progress = Get-Content $ProgressFile -Raw | ConvertFrom-Json -AsHashtable
+            # ConvertFrom-Json returns PSCustomObject, convert to hashtable manually (PS 5.1 compatible)
+            $jsonObj = Get-Content $ProgressFile -Raw | ConvertFrom-Json
+            if ($jsonObj) {
+                $jsonObj.PSObject.Properties | ForEach-Object {
+                    $progress[$_.Name] = $_.Value
+                }
+            }
         }
 
         $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
