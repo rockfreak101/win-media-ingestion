@@ -111,19 +111,19 @@ function Update-Progress {
                 $progress["last_encoded_at"] = $timestamp
                 $progress["current_file"] = $null
                 $progress["current_status"] = "idle"
-                $progress["total_encoded"] = ($progress["total_encoded"] ?? 0) + 1
+                $progress["total_encoded"] = $(if ($null -eq $progress["total_encoded"]) { 0 } else { $progress["total_encoded"] }) + 1
             }
             "skipped" {
                 $progress["last_skipped"] = $FilePath
                 $progress["last_skipped_at"] = $timestamp
                 $progress["last_skipped_reason"] = $Details
-                $progress["total_skipped"] = ($progress["total_skipped"] ?? 0) + 1
+                $progress["total_skipped"] = $(if ($null -eq $progress["total_skipped"]) { 0 } else { $progress["total_skipped"] }) + 1
             }
             "failed" {
                 $progress["last_failed"] = $FilePath
                 $progress["last_failed_at"] = $timestamp
                 $progress["last_failed_reason"] = $Details
-                $progress["total_failed"] = ($progress["total_failed"] ?? 0) + 1
+                $progress["total_failed"] = $(if ($null -eq $progress["total_failed"]) { 0 } else { $progress["total_failed"] }) + 1
                 $progress["current_file"] = $null
                 $progress["current_status"] = "idle"
             }
