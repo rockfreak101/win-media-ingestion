@@ -51,6 +51,7 @@ param(
 
 $LogFile = "C:\Scripts\Logs\nfs-video-processing.log"
 $SkippedFilesLog = "C:\Scripts\Logs\nfs-skipped-already-compressed.log"
+$ProgressFile = "C:\Scripts\Logs\nfs-encoding-progress.json"
 
 # NFS mount base path (the mounted drive letter)
 $NfsBasePath = "${NfsDriveLetter}:\"
@@ -78,6 +79,76 @@ function Write-Log {
     Write-Host $LogMessage
 }
 
+# Progress tracking functions
+function Update-Progress {
+    param(
+        [string]$Event,    # "processing", "encoded", "skipped", "failed", "downloaded"
+        [string]$FilePath,
+        [string]$Details = ""
+    )
+
+    try {
+        $progress = @{}
+        if (Test-Path $ProgressFile) {
+            $progress = Get-Content $ProgressFile -Raw | ConvertFrom-Json -AsHashtable
+        }
+
+        $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+
+        switch ($Event) {
+            "processing" {
+                $progress["current_file"] = $FilePath
+                $progress["current_started"] = $timestamp
+                $progress["current_status"] = "downloading"
+            }
+            "downloaded" {
+                $progress["current_status"] = "encoding"
+                $progress["last_downloaded"] = $FilePath
+                $progress["last_downloaded_at"] = $timestamp
+            }
+            "encoded" {
+                $progress["last_encoded"] = $FilePath
+                $progress["last_encoded_at"] = $timestamp
+                $progress["current_file"] = $null
+                $progress["current_status"] = "idle"
+                $progress["total_encoded"] = ($progress["total_encoded"] ?? 0) + 1
+            }
+            "skipped" {
+                $progress["last_skipped"] = $FilePath
+                $progress["last_skipped_at"] = $timestamp
+                $progress["last_skipped_reason"] = $Details
+                $progress["total_skipped"] = ($progress["total_skipped"] ?? 0) + 1
+            }
+            "failed" {
+                $progress["last_failed"] = $FilePath
+                $progress["last_failed_at"] = $timestamp
+                $progress["last_failed_reason"] = $Details
+                $progress["total_failed"] = ($progress["total_failed"] ?? 0) + 1
+                $progress["current_file"] = $null
+                $progress["current_status"] = "idle"
+            }
+        }
+
+        $progress["updated_at"] = $timestamp
+
+        $progress | ConvertTo-Json -Depth 5 | Set-Content $ProgressFile -Force
+    } catch {
+        Write-Log "Failed to update progress: $($_.Exception.Message)" -Level "WARNING"
+    }
+}
+
+function Get-ProgressSummary {
+    if (Test-Path $ProgressFile) {
+        try {
+            $progress = Get-Content $ProgressFile -Raw | ConvertFrom-Json
+            return $progress
+        } catch {
+            return $null
+        }
+    }
+    return $null
+}
+
 function Write-SkippedFile {
     param(
         [string]$FilePath,
@@ -94,7 +165,16 @@ function Write-SkippedFile {
     }
 
     $LogEntry | Add-Content -Path $SkippedFilesLog
-    Write-Log "SKIPPED (already $Codec): $FilePath" -Level "SKIP"
+
+    # Show correct reason in main log
+    if ($Reason -like "*Low bitrate*") {
+        Write-Log "SKIPPED ($Reason): $FilePath" -Level "SKIP"
+    } else {
+        Write-Log "SKIPPED (already $Codec): $FilePath" -Level "SKIP"
+    }
+
+    # Update progress tracking
+    Update-Progress -Event "skipped" -FilePath $FilePath -Details "$Codec - $Reason"
 }
 
 function Test-AlreadyCompressed {
@@ -292,6 +372,9 @@ function Process-VideoFile {
     Write-Log "Source: $($SourceFile.Directory.FullName)" -Level "INFO"
     Write-Log "========================================" -Level "SUCCESS"
 
+    # Update progress: starting to process
+    Update-Progress -Event "processing" -FilePath $SourceFile.FullName -Details "$codec @ $bitrateMbps Mbps"
+
     # Set up paths
     $localDownloadDir = Join-Path $LocalDownloadPath (Join-Path $mediaType $parentFolder)
     $localDownloadFile = Join-Path $localDownloadDir $fileName
@@ -318,6 +401,9 @@ function Process-VideoFile {
     $downloadTime = (Get-Date) - $downloadStart
     $downloadSpeed = [math]::Round(($SourceFile.Length / 1MB) / $downloadTime.TotalSeconds, 1)
     Write-Log "Download complete: $downloadSpeed MB/s" -Level "SUCCESS"
+
+    # Update progress: download complete, starting encode
+    Update-Progress -Event "downloaded" -FilePath $SourceFile.FullName
 
     # Encode with FFmpeg AMD AMF AV1
     Write-Log "Encoding with AMD AMF AV1: $fileName"
@@ -346,10 +432,33 @@ function Process-VideoFile {
     $processResult.WaitForExit()
     $encodeTime = (Get-Date) - $encodeStart
 
-    if ($processResult.ExitCode -ne 0) {
+    # Handle exit code - null means process may not have completed properly
+    $exitCode = $processResult.ExitCode
+    $encodingSuccess = $false
+
+    # Check if output file exists and has content as backup verification
+    $outputExists = (Test-Path $localEncodedFile) -and ((Get-Item $localEncodedFile -ErrorAction SilentlyContinue).Length -gt 1MB)
+
+    if ($null -eq $exitCode) {
+        # ExitCode is null - check if output file exists as backup verification
+        if ($outputExists) {
+            Write-Log "FFmpeg ExitCode was null but output file exists - treating as success" -Level "WARNING"
+            $encodingSuccess = $true
+        } else {
+            Write-Log "Encoding failed: ExitCode was null and no valid output file" -Level "ERROR"
+        }
+    } elseif ($exitCode -ne 0) {
+        Write-Log "Encoding failed with exit code: $exitCode" -Level "ERROR"
+    } else {
+        $encodingSuccess = $true
+    }
+
+    if (-not $encodingSuccess) {
         $stderr = if (Test-Path $stderrFile) { Get-Content $stderrFile -Tail 20 -Raw } else { "No stderr captured" }
-        Write-Log "Encoding failed with exit code: $($processResult.ExitCode)" -Level "ERROR"
         Write-Log "FFmpeg error: $stderr" -Level "ERROR"
+
+        # Update progress: encoding failed
+        Update-Progress -Event "failed" -FilePath $SourceFile.FullName -Details "Exit code: $exitCode"
 
         # Cleanup
         Remove-Item -Path $stderrFile -Force -ErrorAction SilentlyContinue
@@ -407,6 +516,10 @@ function Process-VideoFile {
     Write-Log "Deleted local encoded: $localEncodedFile"
 
     Write-Log "Processing complete for: $fileName" -Level "SUCCESS"
+
+    # Update progress: encoding successful
+    Update-Progress -Event "encoded" -FilePath $SourceFile.FullName -Details "Reduced $sizeGB GB to $encodedSizeGB GB ($reduction%)"
+
     return $true
 }
 
