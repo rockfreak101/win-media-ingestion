@@ -13,17 +13,18 @@
 # 2025-12-23: Initial creation - NFS pull/encode/push workflow
 # 2025-12-26: Added bitrate detection to skip already-efficient files
 # 2025-12-27: Reverted to sequential encoding for stability
+# 2025-12-27: Switched from SMB to native NFS mount (Samba not available)
 
 param(
-    # NFS/SMB share path
-    [string]$NfsSharePath = "\\10.0.0.1\media",
-    [string]$NfsUser = "jluczani",
-    [string]$NfsPassword = "password",
+    # NFS server and export path
+    [string]$NfsServer = "10.0.0.1",
+    [string]$NfsExport = "/tank/media/media",
+    [string]$NfsDriveLetter = "N",
 
-    # Watch folders (relative to share)
+    # Watch folders (relative to NFS mount)
     [string[]]$WatchFolders = @("More_Movies", "TV"),
 
-    # Destination folders (relative to share)
+    # Destination folders (relative to NFS mount)
     [string]$MoviesEncodedFolder = "Movies_Encoded",
     [string]$TVEncodedFolder = "TV_Encoded",
 
@@ -50,6 +51,9 @@ param(
 
 $LogFile = "C:\Scripts\Logs\nfs-video-processing.log"
 $SkippedFilesLog = "C:\Scripts\Logs\nfs-skipped-already-compressed.log"
+
+# NFS mount base path (the mounted drive letter)
+$NfsBasePath = "${NfsDriveLetter}:\"
 
 # Calculate skip threshold: skip files at or below this bitrate (in kbps)
 $SkipBitrateKbps = $TargetBitrateMbps * 1000 * $BitrateThresholdMultiplier
@@ -179,47 +183,42 @@ function Test-AlreadyCompressed {
     }
 }
 
-function Ensure-SmbSession {
+function Ensure-NfsMount {
     param(
-        [string]$Path,
-        [string]$User,
-        [string]$Password
+        [string]$Server,
+        [string]$Export,
+        [string]$DriveLetter
     )
 
-    try {
-        $testResult = $null
-        try {
-            $testResult = Test-Path $Path -ErrorAction Stop
-        } catch {
-            $testResult = $false
-        }
+    $drivePath = "${DriveLetter}:\"
 
-        if ($testResult) {
+    try {
+        # Check if already mounted and accessible
+        if (Test-Path $drivePath -ErrorAction SilentlyContinue) {
             return $true
         }
 
-        Write-Log "SMB path $Path not accessible, reconnecting..." -Level "WARNING"
+        Write-Log "NFS mount $drivePath not accessible, mounting..." -Level "WARNING"
 
-        net use $Path /delete /y 2>$null | Out-Null
+        # Unmount if exists but inaccessible
+        $unmountResult = cmd /c "umount ${DriveLetter}:" 2>&1
         Start-Sleep -Milliseconds 500
 
-        $netResult = net use $Path /user:$User $Password /persistent:no 2>&1
+        # Mount NFS share
+        $mountCmd = "mount -o anon ${Server}:${Export} ${DriveLetter}:"
+        $mountResult = cmd /c $mountCmd 2>&1
 
         Start-Sleep -Milliseconds 500
-        try {
-            $connected = Test-Path $Path -ErrorAction Stop
-            if ($connected) {
-                Write-Log "SMB session established for $Path" -Level "SUCCESS"
-                return $true
-            }
-        } catch {
-            Write-Log "SMB test failed after connect: $($_.Exception.Message)" -Level "WARNING"
+
+        if (Test-Path $drivePath -ErrorAction SilentlyContinue) {
+            Write-Log "NFS mount established: ${Server}:${Export} -> ${DriveLetter}:" -Level "SUCCESS"
+            return $true
         }
 
-        Write-Log "Could not access $Path - net use result: $netResult" -Level "ERROR"
+        Write-Log "NFS mount failed: $mountResult" -Level "ERROR"
         return $false
     } catch {
-        Write-Log "SMB session failed: $($_.Exception.Message)" -Level "ERROR"
+        Write-Log "NFS mount error: $($_.Exception.Message)" -Level "ERROR"
         return $false
     }
 }
@@ -241,7 +240,7 @@ function Get-NfsVideoFiles {
     $allFiles = @()
 
     foreach ($folder in $WatchFolders) {
-        $watchPath = Join-Path $NfsSharePath $folder
+        $watchPath = Join-Path $NfsBasePath $folder
 
         if (-not (Test-Path $watchPath)) {
             continue
@@ -373,7 +372,7 @@ function Process-VideoFile {
 
     # Upload to NFS
     $destFolder = if ($mediaType -eq "TV") { $TVEncodedFolder } else { $MoviesEncodedFolder }
-    $nfsDestDir = Join-Path $NfsSharePath (Join-Path $destFolder $parentFolder)
+    $nfsDestDir = Join-Path $NfsBasePath (Join-Path $destFolder $parentFolder)
     $nfsDestFile = Join-Path $nfsDestDir $fileName
 
     if (-not (Test-Path $nfsDestDir)) {
@@ -419,10 +418,11 @@ Write-Log "============================================" -Level "SUCCESS"
 Write-Log "NFS Video Processing Monitor Started" -Level "SUCCESS"
 Write-Log "SEQUENTIAL MODE" -Level "SUCCESS"
 Write-Log "============================================" -Level "SUCCESS"
-Write-Log "NFS Base: $NfsSharePath"
+Write-Log "NFS Server: ${NfsServer}:${NfsExport}"
+Write-Log "NFS Mount: $NfsBasePath"
 Write-Log "Watch folders: $($WatchFolders -join ', ')"
-Write-Log "Movies output: $NfsSharePath\$MoviesEncodedFolder"
-Write-Log "TV output: $NfsSharePath\$TVEncodedFolder"
+Write-Log "Movies output: ${NfsBasePath}$MoviesEncodedFolder"
+Write-Log "TV output: ${NfsBasePath}$TVEncodedFolder"
 Write-Log "Local Download: $LocalDownloadPath"
 Write-Log "Local Encoded: $LocalEncodedPath"
 Write-Log "Encoder: FFmpeg AMD AMF AV1 ($TargetBitrateMbps Mbps target, 10 Mbps max)"
@@ -441,9 +441,9 @@ foreach ($dir in @($LocalDownloadPath, $LocalEncodedPath)) {
     }
 }
 
-# Establish SMB session
-if (-not (Ensure-SmbSession -Path $NfsSharePath -User $NfsUser -Password $NfsPassword)) {
-    Write-Log "FATAL: Could not establish SMB session to $NfsSharePath" -Level "ERROR"
+# Mount NFS share
+if (-not (Ensure-NfsMount -Server $NfsServer -Export $NfsExport -DriveLetter $NfsDriveLetter)) {
+    Write-Log "FATAL: Could not mount NFS share ${NfsServer}:${NfsExport}" -Level "ERROR"
     exit 1
 }
 
@@ -452,14 +452,14 @@ Write-Log "Monitoring NFS for video files..."
 while ($true) {
     # Re-establish SMB session if needed
     try {
-        $nfsAccessible = Test-Path $NfsSharePath -ErrorAction Stop
+        $nfsAccessible = Test-Path $NfsBasePath -ErrorAction Stop
     } catch {
         $nfsAccessible = $false
     }
 
     if (-not $nfsAccessible) {
-        Write-Log "NFS path not accessible, reconnecting..." -Level "WARNING"
-        if (-not (Ensure-SmbSession -Path $NfsSharePath -User $NfsUser -Password $NfsPassword)) {
+        Write-Log "NFS mount not accessible, remounting..." -Level "WARNING"
+        if (-not (Ensure-NfsMount -Server $NfsServer -Export $NfsExport -DriveLetter $NfsDriveLetter)) {
             Start-Sleep -Seconds $PollIntervalSeconds
             continue
         }
@@ -491,14 +491,14 @@ while ($true) {
 
         # Re-check SMB connection after each file
         try {
-            $nfsAccessible = Test-Path $NfsSharePath -ErrorAction Stop
+            $nfsAccessible = Test-Path $NfsBasePath -ErrorAction Stop
         } catch {
             $nfsAccessible = $false
         }
 
         if (-not $nfsAccessible) {
-            Write-Log "NFS connection lost after processing, reconnecting..." -Level "WARNING"
-            Ensure-SmbSession -Path $NfsSharePath -User $NfsUser -Password $NfsPassword
+            Write-Log "NFS connection lost after processing, remounting..." -Level "WARNING"
+            Ensure-NfsMount -Server $NfsServer -Export $NfsExport -DriveLetter $NfsDriveLetter
         }
     }
 
