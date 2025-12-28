@@ -14,6 +14,7 @@
 # 2025-12-26: Added bitrate detection to skip already-efficient files
 # 2025-12-27: Reverted to sequential encoding for stability
 # 2025-12-27: Switched from SMB to native NFS mount (Samba not available)
+# 2025-12-28: Added single instance mode (mutex) and queue tracking to prevent duplicates
 
 param(
     # NFS server and export path
@@ -49,9 +50,50 @@ param(
     [double]$BitrateThresholdMultiplier = 1.3
 )
 
+# ============================================================================
+# SINGLE INSTANCE MODE - Prevent multiple instances from running
+# ============================================================================
+$MutexName = "Global\NFS-VideoRips-Encoder"
+$script:Mutex = $null
+$script:MutexOwned = $false
+
+try {
+    $script:Mutex = New-Object System.Threading.Mutex($false, $MutexName)
+
+    # Try to acquire mutex with 0 timeout (don't wait)
+    $script:MutexOwned = $script:Mutex.WaitOne(0)
+
+    if (-not $script:MutexOwned) {
+        Write-Host "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [ERROR] Another instance is already running. Exiting."
+        exit 1
+    }
+} catch [System.Threading.AbandonedMutexException] {
+    # Previous instance crashed, we now own the mutex
+    $script:MutexOwned = $true
+    Write-Host "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [WARNING] Acquired abandoned mutex from crashed instance."
+} catch {
+    Write-Host "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [ERROR] Failed to create mutex: $($_.Exception.Message)"
+    exit 1
+}
+
+# Cleanup mutex on script exit
+$exitHandler = {
+    if ($script:MutexOwned -and $script:Mutex) {
+        try {
+            $script:Mutex.ReleaseMutex()
+            $script:Mutex.Dispose()
+        } catch { }
+    }
+}
+Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action $exitHandler | Out-Null
+
+# ============================================================================
+# FILE PATHS AND QUEUE TRACKING
+# ============================================================================
 $LogFile = "C:\Scripts\Logs\nfs-video-processing.log"
 $SkippedFilesLog = "C:\Scripts\Logs\nfs-skipped-already-compressed.log"
 $ProgressFile = "C:\Scripts\Logs\nfs-encoding-progress.json"
+$QueueFile = "C:\Scripts\Logs\nfs-encoding-queue.json"
 
 # NFS mount base path (the mounted drive letter)
 $NfsBasePath = "${NfsDriveLetter}:\"
@@ -77,6 +119,184 @@ function Write-Log {
 
     $LogMessage | Add-Content -Path $LogFile
     Write-Host $LogMessage
+}
+
+# ============================================================================
+# QUEUE TRACKING - Prevent duplicate file processing
+# ============================================================================
+# Queue states: "queued", "downloading", "encoding", "uploading", "completed", "failed"
+
+function Get-Queue {
+    if (-not (Test-Path $QueueFile)) {
+        return @{}
+    }
+    try {
+        $jsonObj = Get-Content $QueueFile -Raw -ErrorAction Stop | ConvertFrom-Json
+        $queue = @{}
+        if ($jsonObj) {
+            $jsonObj.PSObject.Properties | ForEach-Object {
+                $queue[$_.Name] = $_.Value
+            }
+        }
+        return $queue
+    } catch {
+        return @{}
+    }
+}
+
+function Save-Queue {
+    param([hashtable]$Queue)
+    try {
+        $Queue | ConvertTo-Json -Depth 5 | Set-Content $QueueFile -Force
+    } catch {
+        Write-Log "Failed to save queue: $($_.Exception.Message)" -Level "WARNING"
+    }
+}
+
+function Add-ToQueue {
+    param(
+        [string]$FilePath,
+        [string]$Status = "queued"
+    )
+    $queue = Get-Queue
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+
+    # Check if already in queue
+    if ($queue.ContainsKey($FilePath)) {
+        $existing = $queue[$FilePath]
+        # If completed or failed more than 1 hour ago, allow re-processing
+        if ($existing.status -in @("completed", "failed")) {
+            $existingTime = [DateTime]::ParseExact($existing.updated_at, "yyyy-MM-dd HH:mm:ss", $null)
+            if ((Get-Date) - $existingTime -lt [TimeSpan]::FromHours(1)) {
+                return $false  # Recently processed, skip
+            }
+        } elseif ($existing.status -in @("queued", "downloading", "encoding", "uploading")) {
+            # Check if stale (more than 4 hours old - possible crash)
+            $existingTime = [DateTime]::ParseExact($existing.updated_at, "yyyy-MM-dd HH:mm:ss", $null)
+            if ((Get-Date) - $existingTime -lt [TimeSpan]::FromHours(4)) {
+                return $false  # Still being processed (or recently queued)
+            }
+            Write-Log "Stale queue entry found for $FilePath (last update: $($existing.updated_at)), re-processing" -Level "WARNING"
+        }
+    }
+
+    $queue[$FilePath] = @{
+        status = $Status
+        added_at = $timestamp
+        updated_at = $timestamp
+    }
+    Save-Queue -Queue $queue
+    return $true
+}
+
+function Update-QueueStatus {
+    param(
+        [string]$FilePath,
+        [string]$Status,
+        [string]$Details = ""
+    )
+    $queue = Get-Queue
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+
+    if ($queue.ContainsKey($FilePath)) {
+        # Convert PSCustomObject to hashtable if needed
+        $entry = $queue[$FilePath]
+        if ($entry -is [PSCustomObject]) {
+            $newEntry = @{}
+            $entry.PSObject.Properties | ForEach-Object { $newEntry[$_.Name] = $_.Value }
+            $entry = $newEntry
+        }
+        $entry["status"] = $Status
+        $entry["updated_at"] = $timestamp
+        if ($Details) {
+            $entry["details"] = $Details
+        }
+        $queue[$FilePath] = $entry
+    } else {
+        $queue[$FilePath] = @{
+            status = $Status
+            added_at = $timestamp
+            updated_at = $timestamp
+            details = $Details
+        }
+    }
+    Save-Queue -Queue $queue
+}
+
+function Remove-FromQueue {
+    param([string]$FilePath)
+    $queue = Get-Queue
+    if ($queue.ContainsKey($FilePath)) {
+        $queue.Remove($FilePath)
+        Save-Queue -Queue $queue
+    }
+}
+
+function Test-InQueue {
+    param([string]$FilePath)
+    $queue = Get-Queue
+
+    if (-not $queue.ContainsKey($FilePath)) {
+        return $false
+    }
+
+    $entry = $queue[$FilePath]
+    $status = if ($entry -is [PSCustomObject]) { $entry.status } else { $entry["status"] }
+
+    # If completed or failed, check if we should allow re-processing
+    if ($status -in @("completed", "failed")) {
+        $updatedAt = if ($entry -is [PSCustomObject]) { $entry.updated_at } else { $entry["updated_at"] }
+        $existingTime = [DateTime]::ParseExact($updatedAt, "yyyy-MM-dd HH:mm:ss", $null)
+        if ((Get-Date) - $existingTime -gt [TimeSpan]::FromHours(1)) {
+            return $false  # Old entry, allow re-processing
+        }
+    }
+
+    # If actively processing, check for stale entries
+    if ($status -in @("queued", "downloading", "encoding", "uploading")) {
+        $updatedAt = if ($entry -is [PSCustomObject]) { $entry.updated_at } else { $entry["updated_at"] }
+        $existingTime = [DateTime]::ParseExact($updatedAt, "yyyy-MM-dd HH:mm:ss", $null)
+        if ((Get-Date) - $existingTime -gt [TimeSpan]::FromHours(4)) {
+            return $false  # Stale entry (crashed process), allow re-processing
+        }
+    }
+
+    return $true
+}
+
+function Clean-StaleQueueEntries {
+    $queue = Get-Queue
+    $cleaned = 0
+
+    foreach ($key in @($queue.Keys)) {
+        $entry = $queue[$key]
+        $status = if ($entry -is [PSCustomObject]) { $entry.status } else { $entry["status"] }
+        $updatedAt = if ($entry -is [PSCustomObject]) { $entry.updated_at } else { $entry["updated_at"] }
+
+        try {
+            $existingTime = [DateTime]::ParseExact($updatedAt, "yyyy-MM-dd HH:mm:ss", $null)
+
+            # Remove completed/failed entries older than 24 hours
+            if ($status -in @("completed", "failed") -and ((Get-Date) - $existingTime -gt [TimeSpan]::FromHours(24))) {
+                $queue.Remove($key)
+                $cleaned++
+            }
+            # Remove stale processing entries older than 4 hours
+            elseif ($status -in @("queued", "downloading", "encoding", "uploading") -and ((Get-Date) - $existingTime -gt [TimeSpan]::FromHours(4))) {
+                $queue.Remove($key)
+                $cleaned++
+            }
+        } catch {
+            # Invalid timestamp, remove entry
+            $queue.Remove($key)
+            $cleaned++
+        }
+    }
+
+    if ($cleaned -gt 0) {
+        Save-Queue -Queue $queue
+        Write-Log "Cleaned $cleaned stale queue entries" -Level "INFO"
+    }
 }
 
 # Progress tracking functions
@@ -378,8 +598,9 @@ function Process-VideoFile {
     Write-Log "Source: $($SourceFile.Directory.FullName)" -Level "INFO"
     Write-Log "========================================" -Level "SUCCESS"
 
-    # Update progress: starting to process
+    # Update progress and queue: starting to process
     Update-Progress -Event "processing" -FilePath $SourceFile.FullName -Details "$codec @ $bitrateMbps Mbps"
+    Update-QueueStatus -FilePath $SourceFile.FullName -Status "downloading" -Details "$codec @ $bitrateMbps Mbps"
 
     # Set up paths
     $localDownloadDir = Join-Path $LocalDownloadPath (Join-Path $mediaType $parentFolder)
@@ -408,8 +629,9 @@ function Process-VideoFile {
     $downloadSpeed = [math]::Round(($SourceFile.Length / 1MB) / $downloadTime.TotalSeconds, 1)
     Write-Log "Download complete: $downloadSpeed MB/s" -Level "SUCCESS"
 
-    # Update progress: download complete, starting encode
+    # Update progress and queue: download complete, starting encode
     Update-Progress -Event "downloaded" -FilePath $SourceFile.FullName
+    Update-QueueStatus -FilePath $SourceFile.FullName -Status "encoding"
 
     # Encode with FFmpeg AMD AMF AV1
     Write-Log "Encoding with AMD AMF AV1: $fileName"
@@ -484,8 +706,9 @@ function Process-VideoFile {
         $stderr = if (Test-Path $stderrFile) { Get-Content $stderrFile -Tail 20 -Raw } else { "No stderr captured" }
         Write-Log "FFmpeg error: $stderr" -Level "ERROR"
 
-        # Update progress: encoding failed
+        # Update progress and queue: encoding failed
         Update-Progress -Event "failed" -FilePath $SourceFile.FullName -Details "Exit code: $exitCode"
+        Update-QueueStatus -FilePath $SourceFile.FullName -Status "failed" -Details "Exit code: $exitCode"
 
         # Cleanup
         Remove-Item -Path $stderrFile -Force -ErrorAction SilentlyContinue
@@ -517,11 +740,13 @@ function Process-VideoFile {
     }
 
     Write-Log "Uploading to NFS ($mediaType): $nfsDestFile"
+    Update-QueueStatus -FilePath $SourceFile.FullName -Status "uploading"
     $uploadStart = Get-Date
     try {
         Copy-Item -Path $localEncodedFile -Destination $nfsDestFile -Force
     } catch {
         Write-Log "Upload failed: $($_.Exception.Message)" -Level "ERROR"
+        Update-QueueStatus -FilePath $SourceFile.FullName -Status "failed" -Details "Upload failed: $($_.Exception.Message)"
         return $false
     }
     $uploadTime = (Get-Date) - $uploadStart
@@ -544,8 +769,9 @@ function Process-VideoFile {
 
     Write-Log "Processing complete for: $fileName" -Level "SUCCESS"
 
-    # Update progress: encoding successful
+    # Update progress and queue: encoding successful
     Update-Progress -Event "encoded" -FilePath $SourceFile.FullName -Details "Reduced $sizeGB GB to $encodedSizeGB GB ($reduction%)"
+    Update-QueueStatus -FilePath $SourceFile.FullName -Status "completed" -Details "Reduced $sizeGB GB to $encodedSizeGB GB ($reduction%)"
 
     return $true
 }
@@ -556,7 +782,7 @@ function Process-VideoFile {
 
 Write-Log "============================================" -Level "SUCCESS"
 Write-Log "NFS Video Processing Monitor Started" -Level "SUCCESS"
-Write-Log "SEQUENTIAL MODE" -Level "SUCCESS"
+Write-Log "SINGLE INSTANCE MODE (Mutex acquired)" -Level "SUCCESS"
 Write-Log "============================================" -Level "SUCCESS"
 Write-Log "NFS Server: ${NfsServer}:${NfsExport}"
 Write-Log "NFS Mount: $NfsBasePath"
@@ -570,8 +796,12 @@ Write-Log "Min file size: $MinFileSizeMB MB"
 Write-Log "Poll interval: $PollIntervalSeconds seconds"
 Write-Log "Skip codecs: $($CompressedCodecs -join ', ') (already compressed)"
 Write-Log "Skip bitrate: <= $([math]::Round($SkipBitrateKbps/1000, 1)) Mbps (already efficient)"
+Write-Log "Queue file: $QueueFile"
 Write-Log ""
 Write-Log "Workflow: Download -> Encode -> Upload -> Cleanup"
+
+# Clean stale queue entries on startup
+Clean-StaleQueueEntries
 
 # Create local directories
 foreach ($dir in @($LocalDownloadPath, $LocalEncodedPath)) {
@@ -614,16 +844,30 @@ while ($true) {
         continue
     }
 
+    # Clean stale queue entries periodically (every scan cycle)
+    Clean-StaleQueueEntries
+
     # Process files sequentially
     foreach ($file in $allVideoFiles) {
         $filePath = $file.FullName
 
-        # Skip already processed files
+        # Skip already processed files (in-memory cache)
         if ($script:ProcessedFiles.ContainsKey($filePath)) {
             continue
         }
 
-        # Mark as processed (even if we skip it)
+        # Check queue - skip if already being processed or recently completed
+        if (Test-InQueue -FilePath $filePath) {
+            continue
+        }
+
+        # Try to add to queue (returns false if already queued by another instance)
+        if (-not (Add-ToQueue -FilePath $filePath -Status "queued")) {
+            Write-Log "Skipping $($file.Name) - already in queue" -Level "INFO"
+            continue
+        }
+
+        # Mark as processed in memory (even if we skip it)
         $script:ProcessedFiles[$filePath] = $true
 
         # Process the file
