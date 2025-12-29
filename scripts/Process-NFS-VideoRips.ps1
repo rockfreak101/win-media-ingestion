@@ -267,6 +267,7 @@ function Test-InQueue {
 function Clean-StaleQueueEntries {
     $queue = Get-Queue
     $cleaned = 0
+    $staleFiles = @()
 
     foreach ($key in @($queue.Keys)) {
         $entry = $queue[$key]
@@ -275,14 +276,22 @@ function Clean-StaleQueueEntries {
 
         try {
             $existingTime = [DateTime]::ParseExact($updatedAt, "yyyy-MM-dd HH:mm:ss", $null)
+            $ageHours = ((Get-Date) - $existingTime).TotalHours
 
             # Remove completed/failed entries older than 24 hours
-            if ($status -in @("completed", "failed") -and ((Get-Date) - $existingTime -gt [TimeSpan]::FromHours(24))) {
+            if ($status -in @("completed", "failed") -and $ageHours -gt 24) {
                 $queue.Remove($key)
                 $cleaned++
             }
+            # Remove stale "encoding" entries older than 2 hours (likely crashed)
+            elseif ($status -eq "encoding" -and $ageHours -gt 2) {
+                $queue.Remove($key)
+                $staleFiles += $key
+                $cleaned++
+                Write-Log "Removed stale encoding entry ($([math]::Round($ageHours, 1))h old): $key" -Level "WARNING"
+            }
             # Remove stale processing entries older than 4 hours
-            elseif ($status -in @("queued", "downloading", "encoding", "uploading") -and ((Get-Date) - $existingTime -gt [TimeSpan]::FromHours(4))) {
+            elseif ($status -in @("queued", "downloading", "uploading") -and $ageHours -gt 4) {
                 $queue.Remove($key)
                 $cleaned++
             }
@@ -290,6 +299,14 @@ function Clean-StaleQueueEntries {
             # Invalid timestamp, remove entry
             $queue.Remove($key)
             $cleaned++
+        }
+    }
+
+    # Also clear stale files from in-memory cache so they can be re-processed
+    foreach ($file in $staleFiles) {
+        if ($script:ProcessedFiles.ContainsKey($file)) {
+            $script:ProcessedFiles.Remove($file)
+            Write-Log "Cleared in-memory cache for stale file: $file" -Level "INFO"
         }
     }
 
