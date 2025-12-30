@@ -104,6 +104,30 @@ $SkipBitrateKbps = $TargetBitrateMbps * 1000 * $BitrateThresholdMultiplier
 # Codecs that are considered "already compressed" and should be skipped
 $CompressedCodecs = @("hevc", "h265", "av1", "vp9")
 
+# Anime folder patterns - these get special audio/subtitle handling
+$AnimeFolderPatterns = @(
+    "*Dragon_Ball*",
+    "*Made_in_Abyss*",
+    "*One-Punch_Man*",
+    "*Attack_on_Titan*",
+    "*Naruto*",
+    "*Bleach*",
+    "*Death_Note*",
+    "*Fullmetal*",
+    "*My_Hero_Academia*",
+    "*Demon_Slayer*",
+    "*Jujutsu*",
+    "*Chainsaw*",
+    "*Spy_x_Family*",
+    "*Anime*",
+    "*[Sokudo]*",
+    "*[SubsPlease]*",
+    "*[Erai-raws]*",
+    "*[HorribleSubs]*",
+    "*[CR]*",
+    "*[Judas]*"
+)
+
 # Track processed files to avoid re-processing
 $script:ProcessedFiles = @{}
 
@@ -559,6 +583,117 @@ function Get-MediaType {
     return "Movies"
 }
 
+function Test-IsAnime {
+    param([string]$FilePath)
+
+    foreach ($pattern in $AnimeFolderPatterns) {
+        if ($FilePath -like $pattern) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Get-StreamInfo {
+    param([string]$FilePath)
+
+    try {
+        $ffprobeArgs = @(
+            "-v", "error",
+            "-show_entries", "stream=index,codec_type,codec_name:stream_tags=language,title",
+            "-of", "json",
+            "`"$FilePath`""
+        ) -join ' '
+
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $FFprobePath
+        $psi.Arguments = $ffprobeArgs
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.CreateNoWindow = $true
+
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $psi
+        $process.Start() | Out-Null
+
+        $output = $process.StandardOutput.ReadToEnd()
+        $process.WaitForExit()
+
+        if ($process.ExitCode -ne 0 -or [string]::IsNullOrEmpty($output)) {
+            return $null
+        }
+
+        $json = $output | ConvertFrom-Json
+        return $json.streams
+    } catch {
+        return $null
+    }
+}
+
+function Get-AnimeFFmpegMaps {
+    param([string]$FilePath)
+
+    # For anime: Keep Japanese audio, English audio, and English subtitles
+    $streams = Get-StreamInfo -FilePath $FilePath
+    if (-not $streams) {
+        # Fallback: keep all audio and subtitles
+        return "-map 0:v:0 -map 0:a -map 0:s?"
+    }
+
+    $maps = @("-map 0:v:0")
+    $audioMapped = $false
+    $subMapped = $false
+
+    # Find audio streams
+    $audioStreams = $streams | Where-Object { $_.codec_type -eq "audio" }
+    foreach ($stream in $audioStreams) {
+        $lang = $stream.tags.language
+        $title = $stream.tags.title
+
+        # Keep Japanese audio (jpn, ja, japanese)
+        if ($lang -in @("jpn", "ja", "jap") -or $title -like "*Japan*" -or $title -like "*Original*") {
+            $maps += "-map 0:$($stream.index)"
+            $audioMapped = $true
+        }
+        # Keep English audio (eng, en)
+        elseif ($lang -in @("eng", "en") -or $title -like "*English*" -or $title -like "*Dub*") {
+            $maps += "-map 0:$($stream.index)"
+            $audioMapped = $true
+        }
+    }
+
+    # If no specific audio found, keep first audio
+    if (-not $audioMapped -and $audioStreams) {
+        $maps += "-map 0:a:0"
+    }
+
+    # Find subtitle streams
+    $subStreams = $streams | Where-Object { $_.codec_type -eq "subtitle" }
+    foreach ($stream in $subStreams) {
+        $lang = $stream.tags.language
+        $title = $stream.tags.title
+
+        # Keep English subtitles
+        if ($lang -in @("eng", "en") -or $title -like "*English*") {
+            $maps += "-map 0:$($stream.index)"
+            $subMapped = $true
+        }
+        # Also keep "signs" or "songs" tracks (common in anime)
+        elseif ($title -like "*Sign*" -or $title -like "*Song*" -or $title -like "*Full*") {
+            $maps += "-map 0:$($stream.index)"
+            $subMapped = $true
+        }
+    }
+
+    # If no specific subs found but subs exist, keep all subs
+    if (-not $subMapped -and $subStreams) {
+        $maps += "-map 0:s?"
+    }
+
+    return $maps -join " "
+}
+
 function Get-NfsVideoFiles {
     $allFiles = @()
 
@@ -650,8 +785,17 @@ function Process-VideoFile {
     Update-Progress -Event "downloaded" -FilePath $SourceFile.FullName
     Update-QueueStatus -FilePath $SourceFile.FullName -Status "encoding"
 
+    # Check if this is anime content for special audio/subtitle handling
+    $isAnime = Test-IsAnime -FilePath $SourceFile.FullName
+
     # Encode with FFmpeg AMD AMF AV1
-    Write-Log "Encoding with AMD AMF AV1: $fileName"
+    if ($isAnime) {
+        Write-Log "Encoding with AMD AMF AV1 (ANIME MODE - keeping JPN+ENG audio, ENG subs): $fileName"
+        $streamMaps = Get-AnimeFFmpegMaps -FilePath $localDownloadFile
+    } else {
+        Write-Log "Encoding with AMD AMF AV1: $fileName"
+        $streamMaps = "-map 0:v:0 -map 0:a:0 -map 0:s?"
+    }
 
     # Use temp file for stderr to avoid buffer deadlock
     $stderrFile = Join-Path $env:TEMP "ffmpeg_stderr_$([guid]::NewGuid().ToString('N').Substring(0,8)).log"
@@ -662,7 +806,7 @@ function Process-VideoFile {
     # Start-Process with -PassThru has known issues with WaitForExit()
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $FFmpegPath
-    $psi.Arguments = "-y -i `"$localDownloadFile`" -c:v av1_amf -quality quality -rc vbr_peak -b:v ${TargetBitrateMbps}M -maxrate 10M -map 0:v:0 -map 0:a? -map 0:s? -c:a copy -c:s copy `"$localEncodedFile`""
+    $psi.Arguments = "-y -i `"$localDownloadFile`" -c:v av1_amf -quality quality -rc vbr_peak -b:v ${TargetBitrateMbps}M -maxrate 10M $streamMaps -c:a copy -c:s copy `"$localEncodedFile`""
     $psi.UseShellExecute = $false
     $psi.RedirectStandardError = $true
     $psi.CreateNoWindow = $true
@@ -814,6 +958,7 @@ Write-Log "Poll interval: $PollIntervalSeconds seconds"
 Write-Log "Skip codecs: $($CompressedCodecs -join ', ') (already compressed)"
 Write-Log "Skip bitrate: <= $([math]::Round($SkipBitrateKbps/1000, 1)) Mbps (already efficient)"
 Write-Log "Queue file: $QueueFile"
+Write-Log "Anime patterns: $($AnimeFolderPatterns.Count) patterns (JPN+ENG audio, ENG subs)"
 Write-Log ""
 Write-Log "Workflow: Download -> Encode -> Upload -> Cleanup"
 
