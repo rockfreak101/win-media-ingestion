@@ -634,16 +634,16 @@ function Get-StreamInfo {
 function Get-AnimeFFmpegMaps {
     param([string]$FilePath)
 
-    # For anime: Keep Japanese audio, English audio, and English subtitles
+    # For anime: Keep first audio (original), English audio, and English subtitles
     $streams = Get-StreamInfo -FilePath $FilePath
     if (-not $streams) {
-        # Fallback: keep all audio and subtitles
-        return "-map 0:v:0 -map 0:a -map 0:s?"
+        # Fallback: keep first audio, try to add English, and all subtitles
+        return "-map 0:v:0 -map 0:a:0 -map 0:a:m:language:eng? -map 0:s?"
     }
 
     $maps = @("-map 0:v:0")
-    $audioMapped = $false
-    $subMapped = $false
+    $firstAudioIndex = $null
+    $englishAudioIndices = @()
 
     # Find audio streams
     $audioStreams = $streams | Where-Object { $_.codec_type -eq "audio" }
@@ -651,17 +651,31 @@ function Get-AnimeFFmpegMaps {
         $lang = $stream.tags.language
         $title = $stream.tags.title
 
-        # Keep Japanese audio (jpn, ja, japanese)
-        if ($lang -in @("jpn", "ja", "jap") -or $title -like "*Japan*" -or $title -like "*Original*") {
-            $maps += "-map 0:$($stream.index)"
-            $audioMapped = $true
+        # Track first audio stream (original/default)
+        if ($null -eq $firstAudioIndex) {
+            $firstAudioIndex = $stream.index
         }
-        # Keep English audio (eng, en)
-        elseif ($lang -in @("eng", "en") -or $title -like "*English*" -or $title -like "*Dub*") {
-            $maps += "-map 0:$($stream.index)"
-            $audioMapped = $true
+
+        # Track English audio streams
+        if ($lang -in @("eng", "en") -or $title -like "*English*" -or $title -like "*Dub*") {
+            $englishAudioIndices += $stream.index
         }
     }
+
+    # Always include first audio track (original)
+    if ($null -ne $firstAudioIndex) {
+        $maps += "-map 0:$firstAudioIndex"
+    }
+
+    # Add English audio if different from first track
+    foreach ($engIdx in $englishAudioIndices) {
+        if ($engIdx -ne $firstAudioIndex) {
+            $maps += "-map 0:$engIdx"
+        }
+    }
+
+    $audioMapped = ($null -ne $firstAudioIndex)
+    $subMapped = $false
 
     # If no specific audio found, keep first audio
     if (-not $audioMapped -and $audioStreams) {
@@ -790,7 +804,7 @@ function Process-VideoFile {
 
     # Encode with FFmpeg AMD AMF AV1
     if ($isAnime) {
-        Write-Log "Encoding with AMD AMF AV1 (ANIME MODE - keeping JPN+ENG audio, ENG subs): $fileName"
+        Write-Log "Encoding with AMD AMF AV1 (ANIME MODE - keeping original+ENG audio, ENG subs): $fileName"
         $streamMaps = Get-AnimeFFmpegMaps -FilePath $localDownloadFile
     } else {
         Write-Log "Encoding with AMD AMF AV1: $fileName"
