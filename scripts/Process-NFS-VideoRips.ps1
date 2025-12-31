@@ -120,12 +120,13 @@ $AnimeFolderPatterns = @(
     "*Chainsaw*",
     "*Spy_x_Family*",
     "*Anime*",
-    "*[Sokudo]*",
-    "*[SubsPlease]*",
-    "*[Erai-raws]*",
-    "*[HorribleSubs]*",
-    "*[CR]*",
-    "*[Judas]*"
+    # Release group patterns - brackets escaped for literal matching
+    "*``[Sokudo``]*",
+    "*``[SubsPlease``]*",
+    "*``[Erai-raws``]*",
+    "*``[HorribleSubs``]*",
+    "*``[CR``]*",
+    "*``[Judas``]*"
 )
 
 # Track processed files to avoid re-processing
