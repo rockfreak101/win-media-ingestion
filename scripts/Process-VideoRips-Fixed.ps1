@@ -177,15 +177,37 @@ function Invoke-FFmpegEncode {
         $exitCode = $process.ExitCode
 
         if ($exitCode -eq 0) {
-            Write-Log "Encoding completed successfully (AMD hardware acceleration)" -Level "SUCCESS"
+            Write-Log "FFmpeg exited successfully" -Level "INFO"
 
-            # Show file sizes for comparison
-            if (Test-Path $LocalOutputFile) {
-                $InputSize = (Get-Item $InputFile).Length / 1GB
-                $OutputSize = (Get-Item $LocalOutputFile).Length / 1GB
-                $Reduction = [math]::Round((($InputSize - $OutputSize) / $InputSize) * 100, 1)
-                Write-Log "Size: $([math]::Round($InputSize, 2))GB -> $([math]::Round($OutputSize, 2))GB ($Reduction% reduction)" -Level "SUCCESS"
+            # VALIDATION: Check output file exists and is reasonable size
+            if (-not (Test-Path $LocalOutputFile)) {
+                Write-Log "VALIDATION FAILED: Output file does not exist: $LocalOutputFile" -Level "ERROR"
+                return $false
             }
+            
+            $InputSize = (Get-Item $InputFile).Length
+            $OutputSize = (Get-Item $LocalOutputFile).Length
+            $InputSizeGB = $InputSize / 1GB
+            $OutputSizeGB = $OutputSize / 1GB
+            $OutputSizeMB = $OutputSize / 1MB
+            $MinOutputMB = 50  # Minimum valid output size
+            
+            # Check minimum size
+            if ($OutputSizeMB -lt $MinOutputMB) {
+                Write-Log "VALIDATION FAILED: Output file too small ($([math]::Round($OutputSizeMB, 1)) MB < $MinOutputMB MB minimum)" -Level "ERROR"
+                # Delete invalid output
+                Remove-Item -Path $LocalOutputFile -Force -ErrorAction SilentlyContinue
+                Write-Log "Deleted invalid output file" -Level "WARNING"
+                return $false
+            }
+            
+            # Check for unreasonable expansion (output > 110% of input is suspicious)
+            if ($OutputSize -gt ($InputSize * 1.1)) {
+                Write-Log "WARNING: Output larger than input ($([math]::Round($OutputSizeGB, 2))GB > $([math]::Round($InputSizeGB, 2))GB) - possible encoding issue" -Level "WARNING"
+            }
+            
+            $Reduction = [math]::Round((($InputSizeGB - $OutputSizeGB) / $InputSizeGB) * 100, 1)
+            Write-Log "Encoding VALIDATED: $([math]::Round($InputSizeGB, 2))GB -> $([math]::Round($OutputSizeGB, 2))GB ($Reduction% reduction)" -Level "SUCCESS"
 
             # If SMB destination specified, move file there
             if ($FinalOutputFile) {
@@ -385,3 +407,4 @@ while ($true) {
 
     Start-Sleep -Seconds $PollIntervalSeconds
 }
+
